@@ -24,6 +24,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, relationship, Session
+from fastapi.responses import HTMLResponse
 
 
 # =========================================================
@@ -1645,6 +1646,42 @@ DASHBOARD_HTML = r"""
 def dashboard():
     html = DASHBOARD_HTML.replace("{{DBURL}}", DATABASE_URL)
     return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_policy():
+    return """
+    <html>
+    <head><title>Privacy Policy</title></head>
+    <body style="font-family: Arial; max-width: 800px; margin: auto;">
+        <h1>Privacy Policy</h1>
+
+        <p>This application uses WhatsApp Cloud API to send and receive messages
+        on behalf of the business.</p>
+
+        <h3>Data We Collect</h3>
+        <ul>
+            <li>Phone number</li>
+            <li>Message content sent by users</li>
+        </ul>
+
+        <h3>How We Use Data</h3>
+        <ul>
+            <li>To respond to user queries</li>
+            <li>To provide customer support</li>
+        </ul>
+
+        <h3>Data Storage</h3>
+        <p>Messages are processed in real-time and are not sold or shared with third parties.</p>
+
+        <h3>Contact</h3>
+        <p>Email: support@nathinvestments.com</p>
+
+        <p>Last updated: 2025</p>
+    </body>
+    </html>
+    """
+
 
 
 @app.get("/", response_class=HTMLResponse)
