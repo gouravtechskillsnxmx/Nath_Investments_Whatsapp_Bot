@@ -53,6 +53,12 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v17.0")
 
+# OpenAI (optional auto-replies)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "25"))
+
+
 
 class Base(DeclarativeBase):
     pass
@@ -96,8 +102,107 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
     return r.json()
 
 
+def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
+    """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
+    # If no key, skip auto-reply
+    if not OPENAI_API_KEY:
+        return ""
+
+    # If message contains a policy number, try a DB lookup and craft a deterministic reply (no hallucinations)
+    if policy_number:
+        policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
+        if policy:
+            # Reuse the same factual composition used by /policy/lookup
+            last_payment = db.execute(
+                select(Payment)
+                .where(Payment.policy_id == policy.id)
+                .order_by(desc(Payment.paid_on), desc(Payment.created_at))
+                .limit(1)
+            ).scalars().first()
+
+            next_due = db.execute(
+                select(PremiumSchedule)
+                .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False)  # noqa: E712
+                .order_by(asc(PremiumSchedule.due_date))
+                .limit(1)
+            ).scalars().first()
+
+            next_due_date = next_due.due_date if next_due else policy.next_premium_due_date
+
+            parts = [f"Policy {policy.policy_number} status: {policy.status}."]
+
+            if next_due_date:
+                parts.append(f"Next premium due date: {next_due_date.isoformat()}.")
+            if policy.premium_amount is not None:
+                parts.append(f"Premium amount: ₹{float(policy.premium_amount):,.2f}.")
+            if policy.maturity_date:
+                parts.append(f"Maturity date: {policy.maturity_date.isoformat()}.")
+            if policy.maturity_amount_expected is not None:
+                parts.append(f"Expected maturity amount: ₹{float(policy.maturity_amount_expected):,.2f}.")
+            if last_payment:
+                parts.append(
+                    f"Last payment: {last_payment.paid_on.isoformat()} ({last_payment.status}, ₹{float(last_payment.amount):,.2f})."
+                )
+
+            # Add a short closing line
+            parts.append("If you want, share your registered phone number for verification.")
+            return " ".join(parts)
+
+    # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
+    system = (
+        "You are a WhatsApp support assistant for an insurance/investment advisory office. "
+        "Be concise and WhatsApp-friendly (1-4 short lines). "
+        "Never fabricate policy status, due dates, maturity amounts, NAVs, or any personalized facts. "
+        "If the user asks for policy-specific info and policy number is missing, ask for the policy number. "
+        "If the user asks for investment advice, give general educational guidance and suggest speaking to a human advisor; no guarantees."
+    )
+
+    # Provide a little context to reduce hallucinations
+    context = f"Customer phone: {customer_phone}. Customer name: {customer_name or 'Unknown'}. Extracted policy number: {policy_number or 'None'}."  # not sensitive beyond what WhatsApp already provides
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "developer", "content": "If the user says 'hi' or greetings, greet back and ask how you can help."},
+            {"role": "user", "content": f"{context}\n\nUser message: {user_text}"},
+        ],
+        "max_output_tokens": 220,
+    }
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=OPENAI_TIMEOUT,
+        )
+        if r.status_code >= 400:
+            return ""
+        data = r.json()
+        # Responses API returns output_text in some SDKs; with raw HTTP, parse safely
+        out_text = ""
+        if isinstance(data, dict):
+            # try common shapes
+            if "output_text" in data and isinstance(data["output_text"], str):
+                out_text = data["output_text"]
+            else:
+                # traverse output -> content -> text
+                for item in data.get("output", []) or []:
+                    for c in item.get("content", []) or []:
+                        if c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                            out_text += c.get("text")
+                        elif c.get("type") == "text" and isinstance(c.get("text"), str):
+                            out_text += c.get("text")
+        out_text = (out_text or "").strip()
+        return out_text[:1200]
+    except Exception:
+        return ""
+
+
 # =========================================================
 # DB MODELS
+
 # =========================================================
 
 class Customer(Base):
@@ -473,6 +578,64 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
         )
 
         db.commit()
+
+        # Auto-reply (OpenAI) - keep everything else the same
+        try:
+            if (msg.get("type") == "text") and (text_body or "").strip():
+                reply = openai_generate_reply(
+                    customer_phone=customer_phone,
+                    customer_name=customer_name,
+                    user_text=(text_body or "").strip(),
+                    policy_number=policy_number,
+                    db=db,
+                )
+                if reply:
+                    # Deliver to WhatsApp
+                    send_whatsapp_text(customer_phone, reply)
+
+                    # Store OUT message in the same conversation thread
+                    db.add(
+                        InboxMessage(
+                            conversation_id=conv.id,
+                            direction="OUT",
+                            body=reply,
+                            actor_user_id=None,
+                            created_at=now_utc(),
+                        )
+                    )
+                    conv.last_message_at = now_utc()
+                    conv.updated_at = now_utc()
+
+                    audit(
+                        db,
+                        channel="WHATSAPP",
+                        request_id=None,
+                        action="AUTO_REPLY",
+                        policy_number=policy_number,
+                        customer_phone=customer_phone,
+                        success=True,
+                        reason=None,
+                    )
+                    db.commit()
+        except Exception as _e:
+            # Never fail the webhook; just record a short audit note
+            try:
+                audit(
+                    db,
+                    channel="WHATSAPP",
+                    request_id=None,
+                    action="AUTO_REPLY",
+                    policy_number=policy_number,
+                    customer_phone=customer_phone,
+                    success=False,
+                    reason=str(_e)[:250],
+                )
+            except Exception:
+                pass
+            try:
+                db.commit()
+            except Exception:
+                pass
 
     except Exception as e:
         # log failure but don't error to Meta
