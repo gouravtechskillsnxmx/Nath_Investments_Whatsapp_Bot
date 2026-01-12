@@ -29,7 +29,7 @@ from fastapi import Request, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc
 import re
-
+from datetime import datetime, timezone, timedelta
 
 # =========================================================
 # CONFIG
@@ -68,8 +68,11 @@ class Base(DeclarativeBase):
     pass
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
 def now_utc() -> datetime:
-    return datetime.utcnow()
+    # Return IST time instead of UTC (name unchanged to avoid breaking anything)
+    return datetime.now(IST)
 
 
 def get_db():
