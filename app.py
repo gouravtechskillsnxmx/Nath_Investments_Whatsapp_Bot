@@ -487,6 +487,8 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
     Receives WhatsApp webhook payloads and ingests messages into Team Inbox.
     This does NOT auto-reply; agents reply from the dashboard and replies are delivered.
     """
+    print(">>> META POST /webhook HIT <<<")
+
     data = await request.json()
 
     try:
