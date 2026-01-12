@@ -25,6 +25,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, relationship, Session
 from fastapi.responses import HTMLResponse
+from fastapi import Request, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import select, desc
+import re
 
 
 # =========================================================
@@ -485,159 +489,168 @@ def whatsapp_verify(request: Request):
 async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
     """
     Receives WhatsApp webhook payloads and ingests messages into Team Inbox.
-    This does NOT auto-reply; agents reply from the dashboard and replies are delivered.
+    Auto-reply (OpenAI) is enabled below; everything else stays the same.
     """
     print(">>> META POST /webhook HIT <<<")
 
     data = await request.json()
 
+    handled = 0
+
     try:
-        entry = data["entry"][0]["changes"][0]["value"]
+        # WhatsApp payloads can contain multiple entries/changes/messages
+        for _entry in (data.get("entry") or []):
+            for _change in (_entry.get("changes") or []):
+                entry = (_change.get("value") or {})  # keep variable name "entry"
 
-        # Ignore status callbacks; only handle inbound messages
-        if "messages" not in entry:
-            return {"ok": True}
+                # Ignore status callbacks; only handle inbound messages
+                if "messages" not in entry:
+                    continue
 
-        msg = entry["messages"][0]
-        from_number = msg.get("from")  # often without "+"
-        if not from_number:
-            return {"ok": True}
+                for msg in (entry.get("messages") or []):  # keep variable name "msg"
+                    from_number = msg.get("from")  # often without "+"
+                    if not from_number:
+                        continue
 
-        if msg.get("type") == "text":
-            text_body = msg.get("text", {}).get("body", "")
-        else:
-            text_body = f"[{msg.get('type', 'unknown')} message received]"
+                    if msg.get("type") == "text":
+                        text_body = msg.get("text", {}).get("body", "")
+                    else:
+                        text_body = f"[{msg.get('type', 'unknown')} message received]"
 
-        # Normalize to E.164-like: add + if missing
-        customer_phone = from_number if from_number.startswith("+") else f"+{from_number}"
+                    # Normalize to E.164-like: add + if missing
+                    customer_phone = from_number if from_number.startswith("+") else f"+{from_number}"
 
-        # Try to pull name if provided in contacts
-        customer_name = None
-        if "contacts" in entry and entry["contacts"]:
-            customer_name = entry["contacts"][0].get("profile", {}).get("name")
+                    # Try to pull name if provided in contacts
+                    customer_name = None
+                    if "contacts" in entry and entry["contacts"]:
+                        customer_name = entry["contacts"][0].get("profile", {}).get("name")
 
-        # OPTIONAL: extract policy number from message text (basic)
-        policy_number = None
-        m = re.search(r"\b(\d{6,20})\b", text_body or "")
-        if m:
-            policy_number = m.group(1)
+                    # OPTIONAL: extract policy number from message text (basic)
+                    policy_number = None
+                    m = re.search(r"\b(\d{6,20})\b", text_body or "")
+                    if m:
+                        policy_number = m.group(1)
 
-        # find existing conversation by channel + phone that is not CLOSED (prefer open)
-        conv = db.execute(
-            select(InboxConversation)
-            .where(
-                InboxConversation.channel == "WHATSAPP",
-                InboxConversation.customer_phone == customer_phone,
-                InboxConversation.status != "CLOSED",
-            )
-            .order_by(desc(InboxConversation.last_message_at))
-            .limit(1)
-        ).scalars().first()
+                    # find existing conversation by channel + phone that is not CLOSED (prefer open)
+                    conv = db.execute(
+                        select(InboxConversation)
+                        .where(
+                            InboxConversation.channel == "WHATSAPP",
+                            InboxConversation.customer_phone == customer_phone,
+                            InboxConversation.status != "CLOSED",
+                        )
+                        .order_by(desc(InboxConversation.last_message_at))
+                        .limit(1)
+                    ).scalars().first()
 
-        if not conv:
-            conv = InboxConversation(
-                channel="WHATSAPP",
-                customer_phone=customer_phone,
-                customer_name=customer_name,
-                policy_number=policy_number,
-                status="OPEN",
-                priority="NORMAL",
-                last_message_at=now_utc(),
-                updated_at=now_utc(),
-            )
-            db.add(conv)
-            db.commit()
-            db.refresh(conv)
+                    if not conv:
+                        conv = InboxConversation(
+                            channel="WHATSAPP",
+                            customer_phone=customer_phone,
+                            customer_name=customer_name,
+                            policy_number=policy_number,
+                            status="OPEN",
+                            priority="NORMAL",
+                            last_message_at=now_utc(),
+                            updated_at=now_utc(),
+                        )
+                        db.add(conv)
+                        db.commit()
+                        db.refresh(conv)
 
-        # update conv fields if new info appears
-        if customer_name and not conv.customer_name:
-            conv.customer_name = customer_name
-        if policy_number and not conv.policy_number:
-            conv.policy_number = policy_number
+                    # update conv fields if new info appears
+                    if customer_name and not conv.customer_name:
+                        conv.customer_name = customer_name
+                    if policy_number and not conv.policy_number:
+                        conv.policy_number = policy_number
 
-        conv.last_message_at = now_utc()
-        conv.updated_at = now_utc()
+                    conv.last_message_at = now_utc()
+                    conv.updated_at = now_utc()
 
-        db.add(
-            InboxMessage(
-                conversation_id=conv.id,
-                direction="IN",
-                body=text_body or "[empty]",
-                actor_user_id=None,
-                created_at=now_utc(),
-            )
-        )
-
-        audit(
-            db,
-            channel="WHATSAPP",
-            request_id=None,
-            action="INBOX_INGEST",
-            policy_number=policy_number,
-            customer_phone=customer_phone,
-            success=True,
-            reason=None,
-        )
-
-        db.commit()
-
-        # Auto-reply (OpenAI) - keep everything else the same
-        try:
-            if (msg.get("type") == "text") and (text_body or "").strip():
-                reply = openai_generate_reply(
-                    customer_phone=customer_phone,
-                    customer_name=customer_name,
-                    user_text=(text_body or "").strip(),
-                    policy_number=policy_number,
-                    db=db,
-                )
-                if reply:
-                    # Deliver to WhatsApp
-                    send_whatsapp_text(customer_phone, reply)
-
-                    # Store OUT message in the same conversation thread
                     db.add(
                         InboxMessage(
                             conversation_id=conv.id,
-                            direction="OUT",
-                            body=reply,
+                            direction="IN",
+                            body=text_body or "[empty]",
                             actor_user_id=None,
                             created_at=now_utc(),
                         )
                     )
-                    conv.last_message_at = now_utc()
-                    conv.updated_at = now_utc()
 
                     audit(
                         db,
                         channel="WHATSAPP",
                         request_id=None,
-                        action="AUTO_REPLY",
+                        action="INBOX_INGEST",
                         policy_number=policy_number,
                         customer_phone=customer_phone,
                         success=True,
                         reason=None,
                     )
+
                     db.commit()
-        except Exception as _e:
-            # Never fail the webhook; just record a short audit note
-            try:
-                audit(
-                    db,
-                    channel="WHATSAPP",
-                    request_id=None,
-                    action="AUTO_REPLY",
-                    policy_number=policy_number,
-                    customer_phone=customer_phone,
-                    success=False,
-                    reason=str(_e)[:250],
-                )
-            except Exception:
-                pass
-            try:
-                db.commit()
-            except Exception:
-                pass
+                    handled += 1
+
+                    # Auto-reply (OpenAI) - keep everything else the same
+                    try:
+                        if (msg.get("type") == "text") and (text_body or "").strip():
+                            reply = openai_generate_reply(
+                                customer_phone=customer_phone,
+                                customer_name=customer_name,
+                                user_text=(text_body or "").strip(),
+                                policy_number=policy_number,
+                                db=db,
+                            )
+                            if reply:
+                                # Deliver to WhatsApp
+                                send_whatsapp_text(customer_phone, reply)
+
+                                # Store OUT message in the same conversation thread
+                                db.add(
+                                    InboxMessage(
+                                        conversation_id=conv.id,
+                                        direction="OUT",
+                                        body=reply,
+                                        actor_user_id=None,
+                                        created_at=now_utc(),
+                                    )
+                                )
+                                conv.last_message_at = now_utc()
+                                conv.updated_at = now_utc()
+
+                                audit(
+                                    db,
+                                    channel="WHATSAPP",
+                                    request_id=None,
+                                    action="AUTO_REPLY",
+                                    policy_number=policy_number,
+                                    customer_phone=customer_phone,
+                                    success=True,
+                                    reason=None,
+                                )
+                                db.commit()
+                    except Exception as _e:
+                        # Never fail the webhook; just record a short audit note
+                        try:
+                            audit(
+                                db,
+                                channel="WHATSAPP",
+                                request_id=None,
+                                action="AUTO_REPLY",
+                                policy_number=policy_number,
+                                customer_phone=customer_phone,
+                                success=False,
+                                reason=str(_e)[:250],
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            db.commit()
+                        except Exception:
+                            pass
+
+        # Even if we handled nothing (statuses-only payload), return OK
+        return {"ok": True, "handled": handled}
 
     except Exception as e:
         # log failure but don't error to Meta
@@ -652,11 +665,13 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                 success=False,
                 reason=str(e)[:250],
             )
+            try:
+                db.commit()
+            except Exception:
+                pass
         except Exception:
             pass
-        return {"ok": True}
-
-    return {"ok": True}
+        return {"ok": True, "handled": handled}
 
 
 # =========================================================
