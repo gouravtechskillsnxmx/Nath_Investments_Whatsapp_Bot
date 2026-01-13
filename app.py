@@ -157,11 +157,13 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
     # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
     system = (
-        "You are a WhatsApp support assistant for an insurance/investment advisory office. "
+        "You are the official WhatsApp assistant for Nath Investments, a financial firm offering services in LIC and mutual funds. More details may be provided later (e.g., via a PPT). "
         "Be concise and WhatsApp-friendly (1-4 short lines). "
-        "Never fabricate policy status, due dates, maturity amounts, NAVs, or any personalized facts. "
+        "Answer questions about Nath Investments: services, onboarding, documents needed, office hours, process, fees in general terms. "
+        "Never fabricate policy status, due dates, maturity amounts, NAVs, returns, guarantees, or any personalized facts. "
         "If the user asks for policy-specific info and policy number is missing, ask for the policy number. "
-        "If the user asks for investment advice, give general educational guidance and suggest speaking to a human advisor; no guarantees."
+        "If the user asks for investment advice, give general educational guidance and suggest speaking to a human advisor; no guarantees. "
+        "If the user asks to talk to a human/agent, confirm handoff and tell them an agent will reply shortly."
     )
 
     # Provide a little context to reduce hallucinations
@@ -597,7 +599,51 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                     # Auto-reply (OpenAI) - keep everything else the same
                     try:
                         if (msg.get("type") == "text") and (text_body or "").strip():
-                            reply = openai_generate_reply(
+                            user_clean = (text_body or "").strip()
+
+                            # Human handoff: if user asks for an agent/human, mark conversation PENDING and notify
+                            if re.search(r"(agent|human|representative|advisor|support|call me|callback|talk to|speak to)", user_clean, flags=re.I):
+                                try:
+                                    conv.status = "PENDING"
+                                    conv.updated_at = now_utc()
+                                    conv.last_message_at = now_utc()
+                                    handoff_msg = "Sure — I’m connecting you to a human advisor at Nath Investments. An agent will reply shortly."
+
+                                    # Deliver to WhatsApp
+                                    send_whatsapp_text(customer_phone, handoff_msg)
+
+                                    # Store OUT message in the same conversation thread
+                                    db.add(
+                                        InboxMessage(
+                                            conversation_id=conv.id,
+                                            direction="OUT",
+                                            body=handoff_msg,
+                                            actor_user_id=None,
+                                            created_at=now_utc(),
+                                        )
+                                    )
+                                    conv.last_message_at = now_utc()
+                                    conv.updated_at = now_utc()
+
+                                    audit(
+                                        db,
+                                        channel="WHATSAPP",
+                                        request_id=None,
+                                        action="HUMAN_HANDOFF",
+                                        policy_number=policy_number,
+                                        customer_phone=customer_phone,
+                                        success=True,
+                                        reason=None,
+                                    )
+                                    db.commit()
+                                except Exception:
+                                    # Never fail the webhook for handoff
+                                    try:
+                                        db.commit()
+                                    except Exception:
+                                        pass
+                            else:
+                                reply = openai_generate_reply(
                                 customer_phone=customer_phone,
                                 customer_name=customer_name,
                                 user_text=(text_body or "").strip(),
