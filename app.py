@@ -114,6 +114,39 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
     # Deterministic greeting + menu (ensures menu appears even if the model ignores instructions)
     txt = (user_text or "").strip().lower()
+
+    # Deterministic menu routing for option selections (1/2/3)
+    # Normalize common inputs like "1", "1.", "press 1", "option 1"
+    opt = None
+    m_opt = re.search(r"\b([123])\b", txt)
+    if m_opt and txt in {m_opt.group(1), f"{m_opt.group(1)}.", f"press {m_opt.group(1)}", f"option {m_opt.group(1)}"}:
+        opt = m_opt.group(1)
+    # Also accept single-character inputs with whitespace
+    if txt in {"1", "2", "3"}:
+        opt = txt
+
+    if opt == "1":
+        name = (customer_name or "").strip()
+        prefix = f"Hi {name}, " if name else "Hi, "
+        return (
+            f"{prefix}Nath Investment is a financial firm offering services in LIC and Mutual Funds.\n\n"
+            "✅ LIC Services: New policy guidance, premium due reminders, policy status help, revival support, maturity/claim assistance.\n"
+            "✅ Mutual Funds: SIP & lumpsum guidance, KYC support, portfolio review and general fund selection guidance (no guaranteed returns).\n\n"
+            "If you want, tell me what you’re looking for (LIC or Mutual Funds) and I’ll guide you."
+        )
+
+    if opt == "2":
+        # If policy number wasn't extracted earlier, ask for it.
+        # (Keep policy_number variable usage unchanged by setting it only for this reply path.)
+        if not policy_number:
+            return "Sure. Please share your policy number (6–20 digits) to check your policy details."
+        # If policy_number exists, let the existing DB-first logic handle it.
+        # No return here; continue below into the existing policy lookup logic.
+
+    if opt == "3":
+        # Human handoff phrase; existing handoff logic in webhook can also detect keywords.
+        return "Sure — connecting you to a human advisor now. Please wait, our team will reply shortly."
+
     if txt in {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening", "namaste"}:
         name = (customer_name or "").strip()
         prefix = f"Hi {name}, " if name else "Hi, "
