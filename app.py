@@ -111,6 +111,19 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
 
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
     """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
+
+    # Deterministic greeting + menu (ensures menu appears even if the model ignores instructions)
+    txt = (user_text or "").strip().lower()
+    if txt in {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening", "namaste"}:
+        name = (customer_name or "").strip()
+        prefix = f"Hi {name}, " if name else "Hi, "
+        return (
+            f"👋 {prefix}welcome to *Nath Investment*! I am *Shashinath Thakur*. How can I help you today?\n\n"
+            "Please choose an option 👇\n\n"
+            "🟢 1️⃣  *About Nath Investments & our services*\n"
+            "🔵 2️⃣  *Know your policy details*\n"
+            "🟠 3️⃣  *Talk to our human agent*"
+        )
     # If no key, skip auto-reply
     if not OPENAI_API_KEY:
         return ""
