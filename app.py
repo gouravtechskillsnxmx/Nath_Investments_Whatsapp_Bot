@@ -115,6 +115,14 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
     # Deterministic greeting + menu (ensures menu appears even if the model ignores instructions)
     txt = (user_text or "").strip().lower()
 
+    # Deterministic mutual fund help (avoid incorrectly asking for policy number)
+    if re.search(r"\b(mutual\s*funds?|mf|sip|lumpsum|nav|folio|kyc|redemption|switch|stp|swp)\b", txt, flags=re.I):
+        return (
+            "Mutual Funds (MF) are pooled investments managed by professional fund managers.\n"
+            "You can invest via SIP (monthly) or Lumpsum (one-time). Returns depend on market performance (no guarantees).\n\n"
+            "If you tell me your goal (saving/tax/wealth), time horizon, and whether you prefer SIP or lumpsum, I can guide you on the process and documents (KYC)."
+        )
+
     # Deterministic menu routing for option selections (1/2/3)
     # Normalize common inputs like "1", "1.", "press 1", "option 1"
     opt = None
@@ -200,6 +208,9 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
             # Add a short closing line
             parts.append("If you want, share your registered phone number for verification.")
             return " ".join(parts)
+
+        # If a policy number was provided but not found, reply clearly (no hallucinations)
+        return f"Sorry, no policy found for this policy number: {policy_number}. Please re-check and send the correct policy number." 
 
     # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
     system = (
