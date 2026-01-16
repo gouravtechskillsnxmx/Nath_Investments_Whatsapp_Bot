@@ -1114,6 +1114,221 @@ def admin_list_policies(q: Optional[str] = None, limit: int = 50, db: Session = 
     return {"items": data}
 
 
+
+
+@app.post("/admin/policies/upload")
+async def admin_policies_upload(file: UploadFile = File(...), dry_run: bool = False, db: Session = Depends(get_db)):
+    """Upload policies/customers from an Excel .xlsx file.
+
+    This only INSERTS new records by default (no destructive changes). If a policy_number already exists, that row is skipped.
+
+    Supported headers (case-insensitive):
+      Customer: full_name, phone_e164, email, dob, pan_last4
+      Policy: carrier, policy_number, plan_name, plan_code, status, start_date, end_date, maturity_date,
+             sum_assured, maturity_amount_expected, premium_amount, premium_frequency, next_premium_due_date,
+             grace_period_days, nominee_name, nominee_relation
+    """
+    if openpyxl is None:
+        raise HTTPException(status_code=400, detail="Excel upload requires openpyxl. Add it to requirements.txt and redeploy.")
+    if not (file.filename or "").lower().endswith('.xlsx'):
+        raise HTTPException(status_code=400, detail="Please upload a .xlsx Excel file.")
+
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(filename=BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Excel file: {str(e)[:200]}")
+    ws = wb.active
+
+    # Header map
+    headers = {}
+    first = next(ws.iter_rows(min_row=1, max_row=1))
+    for j, cell in enumerate(first, start=1):
+        key = (str(cell.value).strip().lower() if cell.value is not None else "")
+        if key:
+            headers[key] = j
+
+    def col(name: str):
+        return headers.get(name.lower())
+
+    required = ['policy_number', 'full_name', 'start_date']
+    missing = [r for r in required if col(r) is None]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {', '.join(missing)}")
+
+    def getv(row, name, default=None):
+        j = col(name)
+        if not j:
+            return default
+        v = row[j-1].value
+        return v if v is not None else default
+
+    def parse_date(v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        s = str(v).strip()
+        if not s:
+            return None
+        m1 = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', s)
+        m2 = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', s)
+        if m1:
+            return date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+        if m2:
+            return date(int(m2.group(3)), int(m2.group(2)), int(m2.group(1)))
+        return None
+
+    def parse_num(v):
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except Exception:
+            try:
+                return float(str(v).replace(',', '').strip())
+            except Exception:
+                return None
+
+    created_customers = created_policies = skipped = 0
+    details = []
+
+    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        try:
+            policy_number = str(getv(row, 'policy_number', '')).strip()
+            full_name = str(getv(row, 'full_name', '')).strip()
+            if not policy_number or not full_name:
+                skipped += 1
+                details.append({'row': i, 'status': 'SKIP', 'reason': 'missing policy_number/full_name'})
+                continue
+
+            # Skip if policy exists
+            existing = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
+            if existing:
+                skipped += 1
+                details.append({'row': i, 'status': 'SKIP', 'reason': 'policy exists', 'policy_number': policy_number})
+                continue
+
+            phone = getv(row, 'phone_e164')
+            phone = str(phone).strip() if phone is not None else None
+            email = getv(row, 'email')
+            email = str(email).strip() if email is not None else None
+            dob = parse_date(getv(row, 'dob'))
+            pan_last4 = getv(row, 'pan_last4')
+            pan_last4 = str(pan_last4).strip() if pan_last4 is not None else None
+
+            # Find or create customer
+            cust = None
+            if phone:
+                phone_norm = phone if phone.startswith('+') else f'+{phone}'
+                cust = db.execute(select(Customer).where(Customer.phone_e164 == phone_norm)).scalars().first()
+            else:
+                phone_norm = None
+            if cust is None and email:
+                cust = db.execute(select(Customer).where(Customer.email == email)).scalars().first()
+
+            if cust is None:
+                cust = Customer(
+                    full_name=full_name,
+                    phone_e164=phone_norm,
+                    email=email,
+                    dob=dob,
+                    pan_last4=pan_last4,
+                    created_at=now_utc(),
+                    updated_at=now_utc(),
+                )
+                if not dry_run:
+                    db.add(cust)
+                    db.commit()
+                    db.refresh(cust)
+                created_customers += 1
+            else:
+                # Non-destructive: fill missing fields only
+                changed = False
+                if full_name and not cust.full_name:
+                    cust.full_name = full_name; changed = True
+                if phone_norm and not cust.phone_e164:
+                    cust.phone_e164 = phone_norm; changed = True
+                if email and not cust.email:
+                    cust.email = email; changed = True
+                if dob and not cust.dob:
+                    cust.dob = dob; changed = True
+                if pan_last4 and not cust.pan_last4:
+                    cust.pan_last4 = pan_last4; changed = True
+                if changed and not dry_run:
+                    cust.updated_at = now_utc()
+                    db.add(cust)
+                    db.commit()
+
+            # Policy fields
+            carrier = str(getv(row, 'carrier', 'LIC') or 'LIC').strip() or 'LIC'
+            plan_name = getv(row, 'plan_name')
+            plan_code = getv(row, 'plan_code')
+            status = str(getv(row, 'status', 'ACTIVE') or 'ACTIVE').strip() or 'ACTIVE'
+            start_date = parse_date(getv(row, 'start_date'))
+            if not start_date:
+                skipped += 1
+                details.append({'row': i, 'status': 'SKIP', 'reason': 'missing/invalid start_date', 'policy_number': policy_number})
+                continue
+            end_date = parse_date(getv(row, 'end_date'))
+            maturity_date = parse_date(getv(row, 'maturity_date'))
+            sum_assured = parse_num(getv(row, 'sum_assured'))
+            maturity_amt = parse_num(getv(row, 'maturity_amount_expected'))
+            premium_amt = parse_num(getv(row, 'premium_amount'))
+            premium_freq = str(getv(row, 'premium_frequency', 'YEARLY') or 'YEARLY').strip() or 'YEARLY'
+            next_due = parse_date(getv(row, 'next_premium_due_date'))
+            grace = getv(row, 'grace_period_days')
+            grace = str(grace).strip() if grace is not None else None
+            nominee_name = getv(row, 'nominee_name')
+            nominee_relation = getv(row, 'nominee_relation')
+
+            pol = Policy(
+                carrier=carrier,
+                policy_number=policy_number,
+                customer_id=cust.id if hasattr(cust, 'id') else None,
+                plan_name=str(plan_name).strip() if plan_name is not None else None,
+                plan_code=str(plan_code).strip() if plan_code is not None else None,
+                status=status,
+                start_date=start_date,
+                end_date=end_date,
+                maturity_date=maturity_date,
+                sum_assured=sum_assured,
+                maturity_amount_expected=maturity_amt,
+                premium_amount=premium_amt,
+                premium_frequency=premium_freq,
+                next_premium_due_date=next_due,
+                grace_period_days=grace,
+                nominee_name=str(nominee_name).strip() if nominee_name is not None else None,
+                nominee_relation=str(nominee_relation).strip() if nominee_relation is not None else None,
+                created_at=now_utc(),
+                updated_at=now_utc(),
+            )
+
+            if not dry_run:
+                db.add(pol)
+                db.commit()
+
+            created_policies += 1
+            details.append({'row': i, 'status': 'OK', 'policy_number': policy_number})
+        except Exception as e:
+            skipped += 1
+            details.append({'row': i, 'status': 'ERROR', 'reason': str(e)[:200]})
+            try:
+                if not dry_run:
+                    db.commit()
+            except Exception:
+                pass
+
+    return {
+        'ok': True,
+        'dry_run': bool(dry_run),
+        'created_customers': created_customers,
+        'created_policies': created_policies,
+        'skipped': skipped,
+        'details': details[:200],
+    }
 @app.get("/admin/audit")
 def admin_audit(limit: int = 100, db: Session = Depends(get_db)):
     limit = min(max(limit, 1), 300)
@@ -1792,6 +2007,30 @@ DASHBOARD_HTML = r"""
           <div class="footer">Tip: click a policy number to auto-fill lookup.</div>
         </div>
       </div>
+
+      <div class="card" style="margin-top:12px;">
+        <div class="cardHeader">
+          <h2>Upload Policies (Excel)</h2>
+          <span class="pill">POST /admin/policies/upload</span>
+        </div>
+        <div class="cardBody">
+          <div class="row">
+            <div class="field">
+              <label>Upload .xlsx (required columns: policy_number, full_name, start_date). Optional: phone_e164, email, premium_amount, next_premium_due_date, maturity_date, etc.</label>
+              <input id="pol_xl" type="file" accept=".xlsx" />
+            </div>
+            <div class="field" style="flex:0 0 auto;">
+              <label>&nbsp;</label>
+              <button class="btn btnGhost" onclick="uploadPolicies(true)">Dry Run</button>
+            </div>
+            <div class="field" style="flex:0 0 auto;">
+              <label>&nbsp;</label>
+              <button class="btn" onclick="uploadPolicies(false)">Upload</button>
+            </div>
+          </div>
+          <div class="hint" id="pol_upload_out" style="margin-top:10px;">Ready.</div>
+        </div>
+      </div>
     </div>
 
     <div id="panel-inbox" style="display:none;">
@@ -2049,6 +2288,23 @@ DASHBOARD_HTML = r"""
     }catch(e){
       box.innerHTML = `<div class="small">Network error: ${e}</div>`;
     }
+  }
+
+  async function uploadPolicies(dry){
+    const out = $("pol_upload_out");
+    const f = $("pol_xl").files[0];
+    if(!f){ alert("Please choose an Excel .xlsx file"); return; }
+    out.innerHTML = dry ? "Validating Excel (dry run)…" : "Uploading Excel and importing…";
+    try{
+      const fd = new FormData();
+      fd.append("file", f);
+      const resp = await fetch(`/admin/policies/upload?dry_run=${dry?"true":"false"}`, {method:"POST", body: fd});
+      const data = await resp.json();
+      if(!resp.ok){ out.innerHTML = "Failed: " + escapeHtml(data.detail || "error"); return; }
+      out.innerHTML = `Done. Customers: <b>${data.created_customers}</b>, Policies: <b>${data.created_policies}</b>, Skipped: <b>${data.skipped}</b>.`;
+      await refreshPolicies();
+      await refreshAudit();
+    }catch(e){ out.innerHTML = "Network error: " + escapeHtml(String(e)); }
   }
 
   async function refreshPolicies(){
