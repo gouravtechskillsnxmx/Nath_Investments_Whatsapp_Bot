@@ -3,6 +3,7 @@ import re
 import uuid
 from datetime import datetime, date
 from typing import Optional
+from io import BytesIO
 
 import requests
 try:
@@ -1283,7 +1284,7 @@ async def admin_broadcast_premium_excel(file: UploadFile = File(...), dry_run: b
         raise HTTPException(status_code=400, detail="Please upload a .xlsx Excel file.")
 
     content = await file.read()
-    wb = openpyxl.load_workbook(filename=bytes(content))
+    wb = openpyxl.load_workbook(filename=BytesIO(content))
     ws = wb.active
 
     headers = {}
