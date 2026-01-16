@@ -386,7 +386,7 @@ def _premium_reminder_message(*, policy_number: str, due_date: date | None, amou
         "Reply *2* to check policy details, or reply *3* to talk to our human agent."
     )
 
-def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None) -> InboxConversation:
+def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None) -> \"InboxConversation\":
     conv = db.execute(
         select(InboxConversation)
         .where(
