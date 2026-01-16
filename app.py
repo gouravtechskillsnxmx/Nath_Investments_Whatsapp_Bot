@@ -386,7 +386,7 @@ def _premium_reminder_message(*, policy_number: str, due_date: date | None, amou
         "Reply *2* to check policy details, or reply *3* to talk to our human agent."
     )
 
-def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None) -> \"InboxConversation\":
+def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None):
     conv = db.execute(
         select(InboxConversation)
         .where(
@@ -397,6 +397,7 @@ def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_nam
         .order_by(desc(InboxConversation.last_message_at))
         .limit(1)
     ).scalars().first()
+
     if not conv:
         conv = InboxConversation(
             channel="WHATSAPP",
@@ -411,6 +412,7 @@ def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_nam
         db.add(conv)
         db.commit()
         db.refresh(conv)
+
     return conv
 
 def _already_reminded_today(db: Session, *, policy_number: str, due_date: date | None, customer_phone: str) -> bool:
