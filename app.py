@@ -5,7 +5,12 @@ from datetime import datetime, date
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, Depends, HTTPException, Request
+try:
+    import openpyxl  # for Excel upload
+except Exception:
+    openpyxl = None
+
+from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -109,19 +114,76 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
     return r.json()
 
 
+
+def _fmt_date_ist(d: date | None) -> str:
+    if not d:
+        return "Not available"
+    try:
+        return d.strftime("%d-%b-%Y")
+    except Exception:
+        return str(d)
+
+def _premium_reminder_message(*, policy_number: str, due_date: date | None, amount: float | None) -> str:
+    amt = f"₹{float(amount):,.2f}" if amount is not None else "Not available"
+    dd = _fmt_date_ist(due_date)
+    return (
+        "🔔 *Premium Reminder*\n\n"
+        f"Policy No: *{policy_number}*\n"
+        f"Premium Due Date: *{dd}*\n"
+        f"Premium Amount: *{amt}*\n\n"
+        "Reply *2* to check policy details, or reply *3* to talk to our human agent."
+    )
+
+def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None) -> InboxConversation:
+    conv = db.execute(
+        select(InboxConversation)
+        .where(
+            InboxConversation.channel == "WHATSAPP",
+            InboxConversation.customer_phone == customer_phone,
+            InboxConversation.status != "CLOSED",
+        )
+        .order_by(desc(InboxConversation.last_message_at))
+        .limit(1)
+    ).scalars().first()
+    if not conv:
+        conv = InboxConversation(
+            channel="WHATSAPP",
+            customer_phone=customer_phone,
+            customer_name=customer_name,
+            policy_number=policy_number,
+            status="OPEN",
+            priority="NORMAL",
+            last_message_at=now_utc(),
+            updated_at=now_utc(),
+        )
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+    return conv
+
+def _already_reminded_today(db: Session, *, policy_number: str, due_date: date | None, customer_phone: str) -> bool:
+    today = now_utc().date()
+    sig = f"DUE:{due_date.isoformat() if due_date else 'NA'}"
+    row = db.execute(
+        select(AuditLog)
+        .where(
+            AuditLog.action == "PREMIUM_REMINDER",
+            AuditLog.policy_number == policy_number,
+            AuditLog.customer_phone == customer_phone,
+            AuditLog.created_at >= datetime.combine(today, datetime.min.time(), tzinfo=IST),
+        )
+        .order_by(desc(AuditLog.created_at))
+        .limit(1)
+    ).scalars().first()
+    if not row:
+        return False
+    return (row.reason or "").find(sig) >= 0
+
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
     """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
 
     # Deterministic greeting + menu (ensures menu appears even if the model ignores instructions)
     txt = (user_text or "").strip().lower()
-
-    # Deterministic mutual fund help (avoid incorrectly asking for policy number)
-    if re.search(r"\b(mutual\s*funds?|mf|sip|lumpsum|nav|folio|kyc|redemption|switch|stp|swp)\b", txt, flags=re.I):
-        return (
-            "Mutual Funds (MF) are pooled investments managed by professional fund managers.\n"
-            "You can invest via SIP (monthly) or Lumpsum (one-time). Returns depend on market performance (no guarantees).\n\n"
-            "If you tell me your goal (saving/tax/wealth), time horizon, and whether you prefer SIP or lumpsum, I can guide you on the process and documents (KYC)."
-        )
 
     # Deterministic menu routing for option selections (1/2/3)
     # Normalize common inputs like "1", "1.", "press 1", "option 1"
@@ -208,9 +270,6 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
             # Add a short closing line
             parts.append("If you want, share your registered phone number for verification.")
             return " ".join(parts)
-
-        # If a policy number was provided but not found, reply clearly (no hallucinations)
-        return f"Sorry, no policy found for this policy number: {policy_number}. Please re-check and send the correct policy number." 
 
     # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
     system = (
@@ -1129,6 +1188,183 @@ def admin_inbox_send(conversation_id: str, payload: InboxSendRequest, db: Sessio
     return {"ok": True, "whatsapp_result": wa_result}
 
 
+
+# =========================================================
+# PREMIUM REMINDERS (DB scan + Bulk upload)
+# =========================================================
+
+class PremiumReminderRunResponse(BaseModel):
+    ok: bool
+    scanned: int = 0
+    sent: int = 0
+    skipped: int = 0
+    errors: int = 0
+    details: list[dict] = []
+
+
+@app.post("/admin/reminders/run", response_model=PremiumReminderRunResponse)
+def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: Session = Depends(get_db)):
+    days_ahead = max(0, min(int(days_ahead), 60))
+    today = now_utc().date()
+    end = today + timedelta(days=days_ahead)
+
+    rows = db.execute(
+        select(PremiumSchedule, Policy, Customer)
+        .join(Policy, PremiumSchedule.policy_id == Policy.id)
+        .join(Customer, Policy.customer_id == Customer.id)
+        .where(
+            PremiumSchedule.is_paid == False,
+            PremiumSchedule.due_date >= today,
+            PremiumSchedule.due_date <= end,
+        )
+        .order_by(asc(PremiumSchedule.due_date))
+    ).all()
+
+    scanned = len(rows)
+    sent = skipped = errors = 0
+    details: list[dict] = []
+
+    for ps, pol, cust in rows:
+        try:
+            phone = (cust.phone_e164 or "").strip()
+            if not phone:
+                skipped += 1
+                details.append({"policy_number": pol.policy_number, "status": "SKIP", "reason": "NO_PHONE"})
+                continue
+
+            customer_phone = phone if phone.startswith("+") else f"+{phone}"
+
+            if _already_reminded_today(db, policy_number=pol.policy_number, due_date=ps.due_date, customer_phone=customer_phone):
+                skipped += 1
+                details.append({"policy_number": pol.policy_number, "status": "SKIP", "reason": "ALREADY_SENT_TODAY"})
+                continue
+
+            msg = _premium_reminder_message(
+                policy_number=pol.policy_number,
+                due_date=ps.due_date,
+                amount=float(ps.amount) if ps.amount is not None else (float(pol.premium_amount) if pol.premium_amount is not None else None),
+            )
+
+            if not dry_run:
+                send_whatsapp_text(customer_phone, msg)
+
+            conv = _ensure_inbox_conversation(db, customer_phone=customer_phone, customer_name=cust.full_name, policy_number=pol.policy_number)
+            db.add(InboxMessage(conversation_id=conv.id, direction="OUT", body=msg, actor_user_id=None, created_at=now_utc()))
+            conv.last_message_at = now_utc()
+            conv.updated_at = now_utc()
+            db.commit()
+
+            audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=pol.policy_number, customer_phone=customer_phone, success=True, reason=f"DUE:{ps.due_date.isoformat() if ps.due_date else 'NA'}")
+
+            sent += 1
+            details.append({"policy_number": pol.policy_number, "status": "SENT", "phone": customer_phone, "due_date": ps.due_date.isoformat()})
+        except Exception as e:
+            errors += 1
+            details.append({"policy_number": getattr(pol, "policy_number", None), "status": "ERROR", "reason": str(e)[:200]})
+            try:
+                audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=getattr(pol, "policy_number", None), customer_phone=(cust.phone_e164 if cust else None), success=False, reason=str(e)[:250])
+            except Exception:
+                pass
+            try:
+                db.commit()
+            except Exception:
+                pass
+
+    return PremiumReminderRunResponse(ok=True, scanned=scanned, sent=sent, skipped=skipped, errors=errors, details=details)
+
+
+@app.post("/admin/broadcast/premium")
+async def admin_broadcast_premium_excel(file: UploadFile = File(...), dry_run: bool = False, db: Session = Depends(get_db)):
+    if openpyxl is None:
+        raise HTTPException(status_code=400, detail="Excel upload requires openpyxl. Add it to requirements.txt and redeploy.")
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Please upload a .xlsx Excel file.")
+
+    content = await file.read()
+    wb = openpyxl.load_workbook(filename=bytes(content))
+    ws = wb.active
+
+    headers = {}
+    first = next(ws.iter_rows(min_row=1, max_row=1))
+    for j, cell in enumerate(first, start=1):
+        key = (str(cell.value).strip().lower() if cell.value is not None else "")
+        headers[key] = j
+
+    required = ["phone", "policy_number", "premium_due_date", "premium_amount"]
+    for r in required:
+        if r not in headers:
+            raise HTTPException(status_code=400, detail=f"Missing column '{r}' in Excel header row. Required: {', '.join(required)}")
+
+    sent = skipped = errors = 0
+    details = []
+
+    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        try:
+            phone = str(row[headers["phone"] - 1].value or "").strip()
+            policy_number = str(row[headers["policy_number"] - 1].value or "").strip()
+            due_raw = row[headers["premium_due_date"] - 1].value
+            amt_raw = row[headers["premium_amount"] - 1].value
+
+            if not phone or not policy_number:
+                skipped += 1
+                details.append({"row": i, "status": "SKIP", "reason": "MISSING_PHONE_OR_POLICY"})
+                continue
+
+            customer_phone = phone if phone.startswith("+") else f"+{phone}"
+
+            due_date = None
+            if isinstance(due_raw, datetime):
+                due_date = due_raw.date()
+            elif isinstance(due_raw, date):
+                due_date = due_raw
+            else:
+                s = str(due_raw or "").strip()
+                if s:
+                    m1 = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
+                    m2 = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+                    if m1:
+                        due_date = date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+                    elif m2:
+                        due_date = date(int(m2.group(3)), int(m2.group(2)), int(m2.group(1)))
+
+            amount = None
+            try:
+                if amt_raw is not None and str(amt_raw).strip() != "":
+                    amount = float(amt_raw)
+            except Exception:
+                amount = None
+
+            msg = _premium_reminder_message(policy_number=policy_number, due_date=due_date, amount=amount)
+
+            if not dry_run:
+                send_whatsapp_text(customer_phone, msg)
+
+            conv = _ensure_inbox_conversation(db, customer_phone=customer_phone, customer_name=None, policy_number=policy_number)
+            db.add(InboxMessage(conversation_id=conv.id, direction="OUT", body=msg, actor_user_id=None, created_at=now_utc()))
+            conv.last_message_at = now_utc()
+            conv.updated_at = now_utc()
+            db.commit()
+
+            audit(db, channel="WHATSAPP", request_id=None, action="BULK_PREMIUM_REMINDER", policy_number=policy_number, customer_phone=customer_phone, success=True, reason=f"ROW:{i}")
+
+            sent += 1
+            details.append({"row": i, "status": "SENT", "phone": customer_phone, "policy_number": policy_number})
+        except Exception as e:
+            errors += 1
+            details.append({"row": i, "status": "ERROR", "reason": str(e)[:200]})
+            try:
+                audit(db, channel="WHATSAPP", request_id=None, action="BULK_PREMIUM_REMINDER", policy_number=None, customer_phone=None, success=False, reason=str(e)[:250])
+            except Exception:
+                pass
+            try:
+                db.commit()
+            except Exception:
+                pass
+
+    return {"ok": True, "sent": sent, "skipped": skipped, "errors": errors, "details": details}
+
+
+
 # =========================================================
 # Dashboard (single-file HTML + CSS + JS)
 # =========================================================
@@ -1461,6 +1697,35 @@ DASHBOARD_HTML = r"""
             </div>
           </div>
 
+          
+          <div class="card" style="margin-bottom:12px; border-radius: 16px;">
+            <div class="cardHeader">
+              <h2>Premium Reminders (Bulk + DB)</h2>
+              <span class="pill">Add-on</span>
+            </div>
+            <div class="cardBody">
+              <div class="row">
+                <div class="field" style="flex:0 0 180px;">
+                  <label>DB scan (days ahead)</label>
+                  <input id="rem_days" placeholder="3" value="3" />
+                </div>
+                <div class="field" style="flex:0 0 auto;">
+                  <label>&nbsp;</label>
+                  <button class="btn btnGhost" onclick="runDbReminders()">Run DB Reminders</button>
+                </div>
+                <div class="field">
+                  <label>Upload Excel (.xlsx): phone, policy_number, premium_due_date, premium_amount</label>
+                  <input id="xl_file" type="file" accept=".xlsx" />
+                </div>
+                <div class="field" style="flex:0 0 auto;">
+                  <label>&nbsp;</label>
+                  <button class="btn btnGhost" onclick="sendExcelReminders()">Send Excel Reminders</button>
+                </div>
+              </div>
+              <div class="hint" id="rem_out" style="margin-top:10px;">Ready.</div>
+            </div>
+          </div>
+          
           <div class="inboxGrid">
             <div>
               <div class="convList" id="conv_list">
@@ -1903,7 +2168,49 @@ DASHBOARD_HTML = r"""
     await refreshInbox();
   }
 
-  async function refreshAll(){
+
+  async function runDbReminders(){
+    const out = $("rem_out");
+    out.innerHTML = "Running DB reminder scan…";
+    const days = ($("rem_days").value || "3").trim();
+    try{
+      const resp = await fetch(`/admin/reminders/run?days_ahead=${encodeURIComponent(days)}&dry_run=false`, {method:"POST"});
+      const data = await resp.json();
+      if(!resp.ok){
+        out.innerHTML = "Failed: " + escapeHtml(data.detail || "error");
+        return;
+      }
+      out.innerHTML = `Done. Scanned: <b>${data.scanned}</b>, Sent: <b>${data.sent}</b>, Skipped: <b>${data.skipped}</b>, Errors: <b>${data.errors}</b>.`;
+      await refreshInbox();
+      await refreshAudit();
+    }catch(e){
+      out.innerHTML = "Network error: " + escapeHtml(String(e));
+    }
+  }
+
+  async function sendExcelReminders(){
+    const out = $("rem_out");
+    const f = $("xl_file").files[0];
+    if(!f){ alert("Please choose an Excel .xlsx file"); return; }
+    out.innerHTML = "Uploading Excel and sending reminders…";
+    try{
+      const fd = new FormData();
+      fd.append("file", f);
+      const resp = await fetch(`/admin/broadcast/premium?dry_run=false`, {method:"POST", body: fd});
+      const data = await resp.json();
+      if(!resp.ok){
+        out.innerHTML = "Failed: " + escapeHtml(data.detail || "error");
+        return;
+      }
+      out.innerHTML = `Done. Sent: <b>${data.sent}</b>, Skipped: <b>${data.skipped}</b>, Errors: <b>${data.errors}</b>.`;
+      await refreshInbox();
+      await refreshAudit();
+    }catch(e){
+      out.innerHTML = "Network error: " + escapeHtml(String(e));
+    }
+  }
+
+    async function refreshAll(){
     await refreshPolicies();
     await refreshAudit();
     await refreshInbox();
