@@ -114,71 +114,6 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
     return r.json()
 
 
-
-def _fmt_date_ist(d: date | None) -> str:
-    if not d:
-        return "Not available"
-    try:
-        return d.strftime("%d-%b-%Y")
-    except Exception:
-        return str(d)
-
-def _premium_reminder_message(*, policy_number: str, due_date: date | None, amount: float | None) -> str:
-    amt = f"₹{float(amount):,.2f}" if amount is not None else "Not available"
-    dd = _fmt_date_ist(due_date)
-    return (
-        "🔔 *Premium Reminder*\n\n"
-        f"Policy No: *{policy_number}*\n"
-        f"Premium Due Date: *{dd}*\n"
-        f"Premium Amount: *{amt}*\n\n"
-        "Reply *2* to check policy details, or reply *3* to talk to our human agent."
-    )
-
-def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None) -> InboxConversation:
-    conv = db.execute(
-        select(InboxConversation)
-        .where(
-            InboxConversation.channel == "WHATSAPP",
-            InboxConversation.customer_phone == customer_phone,
-            InboxConversation.status != "CLOSED",
-        )
-        .order_by(desc(InboxConversation.last_message_at))
-        .limit(1)
-    ).scalars().first()
-    if not conv:
-        conv = InboxConversation(
-            channel="WHATSAPP",
-            customer_phone=customer_phone,
-            customer_name=customer_name,
-            policy_number=policy_number,
-            status="OPEN",
-            priority="NORMAL",
-            last_message_at=now_utc(),
-            updated_at=now_utc(),
-        )
-        db.add(conv)
-        db.commit()
-        db.refresh(conv)
-    return conv
-
-def _already_reminded_today(db: Session, *, policy_number: str, due_date: date | None, customer_phone: str) -> bool:
-    today = now_utc().date()
-    sig = f"DUE:{due_date.isoformat() if due_date else 'NA'}"
-    row = db.execute(
-        select(AuditLog)
-        .where(
-            AuditLog.action == "PREMIUM_REMINDER",
-            AuditLog.policy_number == policy_number,
-            AuditLog.customer_phone == customer_phone,
-            AuditLog.created_at >= datetime.combine(today, datetime.min.time(), tzinfo=IST),
-        )
-        .order_by(desc(AuditLog.created_at))
-        .limit(1)
-    ).scalars().first()
-    if not row:
-        return False
-    return (row.reason or "").find(sig) >= 0
-
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
     """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
 
@@ -430,6 +365,71 @@ class AuditLog(Base):
     success = Column(Boolean, nullable=False, default=False)
     reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=now_utc, nullable=False)
+
+
+def _fmt_date_ist(d: date | None) -> str:
+    if not d:
+        return "Not available"
+    try:
+        return d.strftime("%d-%b-%Y")
+    except Exception:
+        return str(d)
+
+def _premium_reminder_message(*, policy_number: str, due_date: date | None, amount: float | None) -> str:
+    amt = f"₹{float(amount):,.2f}" if amount is not None else "Not available"
+    dd = _fmt_date_ist(due_date)
+    return (
+        "🔔 *Premium Reminder*\n\n"
+        f"Policy No: *{policy_number}*\n"
+        f"Premium Due Date: *{dd}*\n"
+        f"Premium Amount: *{amt}*\n\n"
+        "Reply *2* to check policy details, or reply *3* to talk to our human agent."
+    )
+
+def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None) -> InboxConversation:
+    conv = db.execute(
+        select(InboxConversation)
+        .where(
+            InboxConversation.channel == "WHATSAPP",
+            InboxConversation.customer_phone == customer_phone,
+            InboxConversation.status != "CLOSED",
+        )
+        .order_by(desc(InboxConversation.last_message_at))
+        .limit(1)
+    ).scalars().first()
+    if not conv:
+        conv = InboxConversation(
+            channel="WHATSAPP",
+            customer_phone=customer_phone,
+            customer_name=customer_name,
+            policy_number=policy_number,
+            status="OPEN",
+            priority="NORMAL",
+            last_message_at=now_utc(),
+            updated_at=now_utc(),
+        )
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+    return conv
+
+def _already_reminded_today(db: Session, *, policy_number: str, due_date: date | None, customer_phone: str) -> bool:
+    today = now_utc().date()
+    sig = f"DUE:{due_date.isoformat() if due_date else 'NA'}"
+    row = db.execute(
+        select(AuditLog)
+        .where(
+            AuditLog.action == "PREMIUM_REMINDER",
+            AuditLog.policy_number == policy_number,
+            AuditLog.customer_phone == customer_phone,
+            AuditLog.created_at >= datetime.combine(today, datetime.min.time(), tzinfo=IST),
+        )
+        .order_by(desc(AuditLog.created_at))
+        .limit(1)
+    ).scalars().first()
+    if not row:
+        return False
+    return (row.reason or "").find(sig) >= 0
 
 
 # -------- Team Inbox: users, conversations, messages --------
