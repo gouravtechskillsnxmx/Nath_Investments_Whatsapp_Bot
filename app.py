@@ -144,11 +144,32 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
     if opt == "2":
 
+        # If user selected option 2 without typing policy number, reuse the policy_number already linked
+        # to the latest open conversation for this phone (e.g., from the premium reminder flow).
+        if not policy_number:
+            try:
+                conv2 = db.execute(
+                    select(InboxConversation)
+                    .where(
+                        InboxConversation.channel == "WHATSAPP",
+                        InboxConversation.customer_phone == customer_phone,
+                        InboxConversation.status != "CLOSED",
+                        InboxConversation.policy_number.is_not(None),
+                    )
+                    .order_by(desc(InboxConversation.last_message_at))
+                    .limit(1)
+                ).scalars().first()
+                if conv2 and conv2.policy_number:
+                    policy_number = str(conv2.policy_number).strip()
+            except Exception:
+                pass
+
+
         # Policy details (deterministic, DB-backed)
 
         if not policy_number:
 
-            return "Sure. Please share your policy number (6–20 digits) to check your policy details."
+            return "Sure. Please share your policy number (6–20 digits) to check your policy details. (If you received a premium reminder, reply 2 from the same WhatsApp number.)"
 
 
         policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
