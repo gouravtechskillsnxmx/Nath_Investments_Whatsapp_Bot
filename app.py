@@ -143,131 +143,6 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
 
     if opt == "2":
-        # --- ADD: Never auto-pick policy from conversation for option 2 ---
-        # Policy must come from:
-        # 1) reminder message (once), OR
-        # 2) user explicitly typing policy number
-        policy_number = None
-        # --- END ADD ---
-
-        # --- ADD (v2): Multi-policy selection that actually works with IN/OUT-only inbox schema ---
-        # If customer has >1 policies and user sends just "2":
-        #   - Use policy from the latest Premium Reminder OUT message ONLY if we haven't already responded to that reminder.
-        #   - Otherwise ask user to choose a policy number.
-        try:
-            # If user already typed a policy number, let existing logic handle it.
-            typed_policy = None
-            try:
-                mm_typed = re.search(r"\b(\d{6,20})\b", (user_text or ""))
-                if mm_typed:
-                    typed_policy = mm_typed.group(1)
-            except Exception:
-                typed_policy = None
-
-            if (not policy_number) and (not typed_policy):
-                cust_mp = db.execute(select(Customer).where(Customer.phone_e164 == customer_phone)).scalars().first()
-                pols_mp = []
-                if cust_mp:
-                    pols_mp = db.execute(select(Policy).where(Policy.customer_id == cust_mp.id).order_by(desc(Policy.created_at))).scalars().all() or []
-
-                if len(pols_mp) > 1:
-                    # locate the latest open conversation (same one used by webhook)
-                    conv_mp = db.execute(
-                        select(InboxConversation)
-                        .where(
-                            InboxConversation.channel == "WHATSAPP",
-                            InboxConversation.customer_phone == customer_phone,
-                            InboxConversation.status != "CLOSED",
-                        )
-                        .order_by(desc(InboxConversation.last_message_at))
-                        .limit(1)
-                    ).scalars().first()
-
-                    reminder_policy = None
-                    reminder_sent_at = None
-                    reminder_consumed = False
-
-                    if conv_mp is not None:
-                        # find the latest premium reminder OUT message and parse policy number from it
-                        outs = db.execute(
-                            select(InboxMessage)
-                            .where(
-                                InboxMessage.conversation_id == conv_mp.id,
-																 
-																					  
-							 
-																	
-									 
-										   
-																								   
-													   
-
-																				 
-											 
-												
-								   
-																		   
-                                InboxMessage.direction == "OUT",
-                            )
-                            .order_by(desc(InboxMessage.created_at))
-                            .limit(25)
-                        ).scalars().all() or []
-
-                        for mo in outs:
-                            b = (mo.body or "")
-                            if ("Premium Reminder" in b) and ("Policy No" in b):
-                                mpol = re.search(r"Policy\s*No\s*:\s*\*([^*]+)\*", b)
-                                if not mpol:
-                                    mpol = re.search(r"Policy\s*No\s*:\s*(\d{6,20})", b)
-                                if mpol:
-                                    reminder_policy = (mpol.group(1) or "").strip()
-                                    reminder_sent_at = getattr(mo, "created_at", None)
-                                    break
-
-                        # If we found a reminder, check if we already replied with details AFTER that reminder.
-                        if reminder_policy and reminder_sent_at:
-                            # Look for an OUT message after reminder that contains "Policy <no>" and "details"
-                            replied = db.execute(
-                                select(InboxMessage)
-                                .where(
-												 
-                                    InboxMessage.conversation_id == conv_mp.id,
-                                    InboxMessage.direction == "OUT",
-                                    InboxMessage.created_at > reminder_sent_at,
-														   
-															 
-									 
-                                )
-                                .order_by(desc(InboxMessage.created_at))
-                                .limit(15)
-                            ).scalars().all() or []
-                            for rmsg in replied:
-                                txtb = (rmsg.body or "").lower()
-                                if (str(reminder_policy) in (rmsg.body or "")) and ("details" in txtb or "policy" in txtb):
-                                    reminder_consumed = True
-                                    break
-
-                    # Use reminder policy only if not consumed yet
-                    if reminder_policy and (not reminder_consumed):
-                        policy_number = reminder_policy
-                    else:
-                        # Ask user to pick policy (do not auto-pick any stored one)
-                        top = pols_mp[:10]
-                        lines = ["You have multiple policies. Please reply with the *policy number* you want to check:"]
-                        for p in top:
-                            md = getattr(p, "maturity_date", None)
-                            md_txt = ""
-                            try:
-                                md_txt = f" (Maturity: {_fmt_date_ist(md)})" if md else ""
-                            except Exception:
-                                md_txt = ""
-                            lines.append(f"• *{p.policy_number}*{md_txt}")
-                        lines.append("Tip: You can copy/paste the policy number here.")
-                        return "\n".join(lines)
-        except Exception:
-            pass
-        # --- END ADD (v2) ---
-
 
         # If user selected option 2 without typing policy number, reuse the policy_number already linked
         # to the latest open conversation for this phone (e.g., from the premium reminder flow).
@@ -480,7 +355,7 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
                 )
 
             # Add a short closing line
-            parts.append("If you want, share your registered phone number for verification.")
+            # (kept concise) No extra verification request here to avoid confusing phone as policy number.
             return " ".join(parts)
 
     # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
@@ -929,6 +804,16 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                     if m:
                         policy_number = m.group(1)
 
+        # ADD: avoid mistaking phone number as policy number
+        try:
+            if policy_number:
+                digits_phone = re.sub(r"\D", "", customer_phone or "")
+                digits_pol = re.sub(r"\D", "", str(policy_number))
+                # If extracted number equals the customer phone (last 10 digits), treat it as phone, not policy
+                if digits_phone and digits_pol and (digits_pol == digits_phone or digits_pol == digits_phone[-10:]):
+                    policy_number = None
+        except Exception:
+            pass
                     # find existing conversation by channel + phone that is not CLOSED (prefer open)
                     conv = db.execute(
                         select(InboxConversation)
