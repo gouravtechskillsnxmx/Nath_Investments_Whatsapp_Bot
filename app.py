@@ -143,12 +143,12 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
 
     if opt == "2":
-	# --- ADD: Never auto-pick policy from conversation for option 2 ---
-	# Policy must come from:
-	# 1) reminder message (once), OR
-	# 2) user explicitly typing policy number
-	policy_number = None
-	# --- END ADD ---
+        # --- ADD: Never auto-pick policy from conversation for option 2 ---
+        # Policy must come from:
+        # 1) reminder message (once), OR
+        # 2) user explicitly typing policy number
+        policy_number = None
+        # --- END ADD ---
 
         # --- ADD (v2): Multi-policy selection that actually works with IN/OUT-only inbox schema ---
         # If customer has >1 policies and user sends just "2":
