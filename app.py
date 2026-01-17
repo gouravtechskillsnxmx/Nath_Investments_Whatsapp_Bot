@@ -165,7 +165,100 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
                 pass
 
 
-        # Policy details (deterministic, DB-backed)
+        
+        # --- ADD: Multi-policy selection + reminder-policy pick ---
+        # If user replied "2" to a premium reminder, prefer the policy number from the last reminder message once.
+        # After that, if the customer has multiple policies and no policy number is provided, ask them to choose.
+        try:
+            conv_for_opt2 = None
+            try:
+                conv_for_opt2 = conv2  # from above block if available
+            except Exception:
+                conv_for_opt2 = None
+
+            # Get latest open conversation if conv2 not available
+            if conv_for_opt2 is None:
+                conv_for_opt2 = db.execute(
+                    select(InboxConversation)
+                    .where(
+                        InboxConversation.channel == "WHATSAPP",
+                        InboxConversation.customer_phone == customer_phone,
+                        InboxConversation.status != "CLOSED",
+                    )
+                    .order_by(desc(InboxConversation.last_message_at))
+                    .limit(1)
+                ).scalars().first()
+
+            reminder_policy = None
+            reminder_already_used = False
+
+            if conv_for_opt2 is not None:
+                # Detect if we've already used reminder-policy once in this conversation
+                note = db.execute(
+                    select(InboxMessage)
+                    .where(
+                        InboxMessage.conversation_id == conv_for_opt2.id,
+                        InboxMessage.direction == "NOTE",
+                        InboxMessage.body.like("%REMINDER_POLICY_CONSUMED:%"),
+                    )
+                    .order_by(desc(InboxMessage.created_at))
+                    .limit(1)
+                ).scalars().first()
+                if note and (note.body or "").find("REMINDER_POLICY_CONSUMED:") >= 0:
+                    reminder_already_used = True
+
+                # Parse policy number from the latest premium reminder OUT message
+                outs = db.execute(
+                    select(InboxMessage)
+                    .where(
+                        InboxMessage.conversation_id == conv_for_opt2.id,
+                        InboxMessage.direction == "OUT",
+                    )
+                    .order_by(desc(InboxMessage.created_at))
+                    .limit(5)
+                ).scalars().all()
+
+                for m_out in outs or []:
+                    b = (m_out.body or "")
+                    if ("Premium Reminder" in b) and ("Policy No" in b):
+                        mm = re.search(r"Policy\s*No\s*:\s*\*([^*]+)\*", b)
+                        if not mm:
+                            mm = re.search(r"Policy\s*No\s*:\s*([A-Za-z0-9\-/]{4,40})", b)
+                        if mm:
+                            reminder_policy = (mm.group(1) or "").strip()
+                            break
+
+            # If user didn't provide a policy number and a reminder policy exists, use it ONCE
+            if (not policy_number) and reminder_policy and (not reminder_already_used):
+                policy_number = reminder_policy
+
+            # If still no policy number, handle multi-policy selection (by customer phone -> Customer -> Policies)
+            if not policy_number:
+                cust = db.execute(select(Customer).where(Customer.phone_e164 == customer_phone)).scalars().first()
+                pols = []
+                if cust:
+                    pols = db.execute(select(Policy).where(Policy.customer_id == cust.id).order_by(desc(Policy.created_at))).scalars().all() or []
+                if len(pols) == 1:
+                    policy_number = pols[0].policy_number
+                elif len(pols) > 1:
+                    top = pols[:8]
+                    lines = ["You have multiple policies. Please reply with the *policy number* you want to check:"]
+                    for p in top:
+                        md = getattr(p, "maturity_date", None)
+                        md_txt = ""
+                        try:
+                            md_txt = f" (Maturity: {_fmt_date_ist(md)})" if md else ""
+                        except Exception:
+                            md_txt = ""
+                        lines.append(f"• *{p.policy_number}*{md_txt}")
+                    lines.append("Tip: You can copy/paste the policy number here.")
+                    return "\n".join(lines)
+        except Exception:
+            # Never break option 2 flow; fall back to existing behavior
+            pass
+        # --- END ADD ---
+
+# Policy details (deterministic, DB-backed)
 
         if not policy_number:
 
@@ -177,6 +270,27 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
         if not policy:
 
             return f"Sorry, no policy found for this policy number: {policy_number}."
+
+        # --- ADD: mark reminder-policy as consumed once we respond (so next '2' asks selection if multiple) ---
+        try:
+            if conv_for_opt2 is not None and reminder_policy and (policy_number == reminder_policy) and (not reminder_already_used):
+                db.add(
+                    InboxMessage(
+                        conversation_id=conv_for_opt2.id,
+                        direction="NOTE",
+                        body=f"[CTX] REMINDER_POLICY_CONSUMED:{policy_number}",
+                        actor_user_id=None,
+                        created_at=now_utc(),
+                    )
+                )
+                db.commit()
+        except Exception:
+            try:
+                db.commit()
+            except Exception:
+                pass
+        # --- END ADD ---
+
 
 
         # Start date (best-effort)
