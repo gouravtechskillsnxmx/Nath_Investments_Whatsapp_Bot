@@ -144,32 +144,11 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
     if opt == "2":
 
-        # If user selected option 2 without typing policy number, reuse the policy_number already linked
-        # to the latest open conversation for this phone (e.g., from the premium reminder flow).
-        if not policy_number:
-            try:
-                conv2 = db.execute(
-                    select(InboxConversation)
-                    .where(
-                        InboxConversation.channel == "WHATSAPP",
-                        InboxConversation.customer_phone == customer_phone,
-                        InboxConversation.status != "CLOSED",
-                        InboxConversation.policy_number.is_not(None),
-                    )
-                    .order_by(desc(InboxConversation.last_message_at))
-                    .limit(1)
-                ).scalars().first()
-                if conv2 and conv2.policy_number:
-                    policy_number = str(conv2.policy_number).strip()
-            except Exception:
-                pass
-
-
         # Policy details (deterministic, DB-backed)
 
         if not policy_number:
 
-            return "Sure. Please share your policy number (6–20 digits) to check your policy details. (If you received a premium reminder, reply 2 from the same WhatsApp number.)"
+            return "Sure. Please share your policy number (6–20 digits) to check your policy details."
 
 
         policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
@@ -355,7 +334,7 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
                 )
 
             # Add a short closing line
-            # (kept concise) No extra verification request here to avoid confusing phone as policy number.
+            parts.append("If you want, share your registered phone number for verification.")
             return " ".join(parts)
 
     # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
@@ -804,16 +783,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                     if m:
                         policy_number = m.group(1)
 
-        # ADD: avoid mistaking phone number as policy number
-        try:
-            if policy_number:
-                digits_phone = re.sub(r"\D", "", customer_phone or "")
-                digits_pol = re.sub(r"\D", "", str(policy_number))
-                # If extracted number equals the customer phone (last 10 digits), treat it as phone, not policy
-                if digits_phone and digits_pol and (digits_pol == digits_phone or digits_pol == digits_phone[-10:]):
-                    policy_number = None
-        except Exception:
-            pass
                     # find existing conversation by channel + phone that is not CLOSED (prefer open)
                     conv = db.execute(
                         select(InboxConversation)
