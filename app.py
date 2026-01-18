@@ -121,6 +121,101 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
     # Deterministic greeting + menu (ensures menu appears even if the model ignores instructions)
     txt = (user_text or "").strip().lower()
 
+
+    # ADD: policy context + phone-vs-policy guard
+    # Prevent the bot from treating the customer's own phone number as a policy number.
+    try:
+        _digits_phone = re.sub(r"\D", "", customer_phone or "")
+        _digits_in = re.sub(r"\D", "", user_text or "")
+        if _digits_in and _digits_phone and (_digits_in == _digits_phone or _digits_in == _digits_phone[-10:]):
+            return "Thanks! Please share your *policy number* (6–20 digits) to check your policy details."
+    except Exception:
+        pass
+
+    def _compose_policy_details(_policy_number: str) -> str:
+        """DB-backed policy details (start date, total paid, remaining, maturity)."""
+        if not _policy_number:
+            return "Sure. Please share your policy number (6–20 digits) to check your policy details."
+
+        pol = db.execute(select(Policy).where(Policy.policy_number == _policy_number)).scalars().first()
+        if not pol:
+            return f"Sorry, no policy found for this policy number: {_policy_number}."
+
+        # Start date best-effort
+        start_date = None
+        try:
+            start_date = getattr(pol, "start_date", None) or getattr(pol, "policy_start_date", None)
+        except Exception:
+            start_date = None
+        if not start_date:
+            try:
+                start_date = getattr(pol, "created_at", None)
+            except Exception:
+                start_date = None
+
+        # Total premium paid (sum payments that look paid)
+        total_paid = 0.0
+        try:
+            pays = db.execute(select(Payment).where(Payment.policy_id == pol.id)).scalars().all() or []
+            for pay in pays:
+                st = (getattr(pay, "status", "") or "").upper()
+                if st in ("PAID", "SUCCESS", "COMPLETED") or st == "":
+                    try:
+                        total_paid += float(getattr(pay, "amount", 0) or 0)
+                    except Exception:
+                        pass
+        except Exception:
+            total_paid = 0.0
+
+        # Remaining premium (best-effort: total_premium_amount - paid)
+        remaining = None
+        try:
+            total_target = getattr(pol, "total_premium_amount", None) or getattr(pol, "sum_assured", None)
+            if total_target is not None:
+                remaining = max(0.0, float(total_target) - float(total_paid))
+        except Exception:
+            remaining = None
+
+        # Maturity date
+        maturity = None
+        try:
+            maturity = getattr(pol, "maturity_date", None)
+        except Exception:
+            maturity = None
+
+        started_txt = start_date.isoformat() if start_date else "Not available"
+        maturity_txt = maturity.isoformat() if maturity else "Not available"
+        remaining_txt = f"₹{remaining:,.2f}" if remaining is not None else "Not available"
+
+        return (
+            f"✅ Policy *{pol.policy_number}* details:\n"
+            f"• Started on: *{started_txt}*\n"
+            f"• Total premium paid: *₹{total_paid:,.2f}*\n"
+            f"• Remaining premium: *{remaining_txt}*\n"
+            f"• Maturity date: *{maturity_txt}*\n\n"
+            "Reply *3* to talk to our human agent."
+        )
+
+    # If user is asking for details without sending a policy number in this message,
+    # reuse the most recent policy number from the open WhatsApp conversation (if any).
+    if not policy_number and any(k in txt for k in ["details", "detail", "status", "policy", "premium", "maturity"]):
+        try:
+            _convp = db.execute(
+                select(InboxConversation)
+                .where(
+                    InboxConversation.channel == "WHATSAPP",
+                    InboxConversation.customer_phone == customer_phone,
+                    InboxConversation.status != "CLOSED",
+                    InboxConversation.policy_number.is_not(None),
+                )
+                .order_by(desc(InboxConversation.last_message_at))
+                .limit(1)
+            ).scalars().first()
+            if _convp and _convp.policy_number:
+                return _compose_policy_details(str(_convp.policy_number).strip())
+        except Exception:
+            pass
+
     # Deterministic menu routing for option selections (1/2/3)
     # Normalize common inputs like "1", "1.", "press 1", "option 1"
     opt = None
@@ -144,112 +239,6 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
     if opt == "2":
 
-        # --- ADD: smarter option-2 policy resolution (agentic-style, DB-backed) ---
-        # Goals:
-        # 1) Never treat the customer phone number as a policy number.
-        # 2) If customer has multiple policies and no policy number is provided, ask them to choose.
-        # 3) If the user is responding to a Premium Reminder, use that reminder's policy number (once-per-reminder).
-
-        def _digits(s: str) -> str:
-            return re.sub(r"\D", "", s or "")
-
-        def _is_same_as_phone(num: str) -> bool:
-            dp = _digits(customer_phone)
-            dn = _digits(num)
-            return bool(dp and dn and (dn == dp or dn == dp[-10:]))
-
-        # If user explicitly typed a number, consider it as a candidate policy (unless it's their phone)
-        typed_policy = None
-        m_typed = re.search(r"\b(\d{6,20})\b", (user_text or ""))
-        if m_typed:
-            cand = m_typed.group(1)
-            if not _is_same_as_phone(cand):
-                typed_policy = cand
-
-        if typed_policy:
-            policy_number = typed_policy
-
-        # If no policy number yet, try to infer from latest Premium Reminder OUT message in the same conversation
-        if not policy_number:
-            try:
-                conv2 = db.execute(
-                    select(InboxConversation)
-                    .where(
-                        InboxConversation.channel == "WHATSAPP",
-                        InboxConversation.customer_phone == customer_phone,
-                        InboxConversation.status != "CLOSED",
-                    )
-                    .order_by(desc(InboxConversation.last_message_at))
-                    .limit(1)
-                ).scalars().first()
-
-                reminder_policy = None
-                reminder_sent_at = None
-                reminder_consumed = False
-
-                if conv2 is not None:
-                    outs = db.execute(
-                        select(InboxMessage)
-                        .where(
-                            InboxMessage.conversation_id == conv2.id,
-                            InboxMessage.direction == "OUT",
-                        )
-                        .order_by(desc(InboxMessage.created_at))
-                        .limit(30)
-                    ).scalars().all() or []
-
-                    for mo in outs:
-                        b = (mo.body or "")
-                        if ("Premium Reminder" in b) and ("Policy" in b):
-                            mp = re.search(r"Policy\s*No\s*:\s*\*([^*]+)\*", b)
-                            if not mp:
-                                mp = re.search(r"Policy\s*No\s*:\s*(\d{6,20})", b)
-                            if mp:
-                                reminder_policy = (mp.group(1) or "").strip()
-                                reminder_sent_at = getattr(mo, "created_at", None)
-                                break
-
-                    # consider reminder "consumed" if we've already sent policy details after that reminder
-                    if reminder_policy and reminder_sent_at:
-                        replied = db.execute(
-                            select(InboxMessage)
-                            .where(
-                                InboxMessage.conversation_id == conv2.id,
-                                InboxMessage.direction == "OUT",
-                                InboxMessage.created_at > reminder_sent_at,
-                            )
-                            .order_by(desc(InboxMessage.created_at))
-                            .limit(20)
-                        ).scalars().all() or []
-                        for rmsg in replied:
-                            bt = (rmsg.body or "")
-                            if (str(reminder_policy) in bt) and ("Policy" in bt or "details" in bt.lower()):
-                                reminder_consumed = True
-                                break
-
-                if reminder_policy and (not reminder_consumed) and (not _is_same_as_phone(reminder_policy)):
-                    policy_number = reminder_policy
-            except Exception:
-                pass
-
-        # If still no policy number, and customer has multiple policies, ask them to pick
-        if not policy_number:
-            try:
-                cust = db.execute(select(Customer).where(Customer.phone_e164 == customer_phone)).scalars().first()
-                pols = []
-                if cust:
-                    pols = db.execute(select(Policy).where(Policy.customer_id == cust.id)).scalars().all() or []
-
-                if len(pols) > 1:
-                    lines = ["You have multiple policies. Please reply with the *policy number* you want to check:"]
-                    for p in pols[:10]:
-                        lines.append(f"• *{p.policy_number}*")
-                    lines.append("Tip: Copy/paste the policy number here.")
-                    return "\n".join(lines)
-            except Exception:
-                pass
-
-        # --- END ADD ---
         # Policy details (deterministic, DB-backed)
 
         if not policy_number:
@@ -440,7 +429,7 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
                 )
 
             # Add a short closing line
-            # removed: do not ask for phone verification
+            parts.append("If you want, share your registered phone number for verification.")
             return " ".join(parts)
 
     # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
