@@ -1,41 +1,31 @@
 import os
 import re
-from io import BytesIO
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional
 
 import requests
-try:
-  import openpyxl # for Excel upload
-except Exception:
-  openpyxl = None
-
-from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-  create_engine,
-  Column,
-  String,
-  Date,
-  DateTime,
-  Boolean,
-  Numeric,
-  ForeignKey,
-  Text,
-  select,
-  desc,
-  asc,
-  func,
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    Text,
+    asc,
+    create_engine,
+    desc,
+    func,
+    select,
+    update,
 )
-from sqlalchemy.orm import sessionmaker, DeclarativeBase, relationship, Session
-from fastapi.responses import HTMLResponse
-from fastapi import Request, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import select, desc
-import re
-from datetime import datetime, timezone, timedelta
+from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
+
 
 # =========================================================
 # CONFIG
@@ -47,14 +37,14 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./insure.db")
 
 connect_args = {}
 if DATABASE_URL.startswith("sqlite"):
-  connect_args = {"check_same_thread": False}
+    connect_args = {"check_same_thread": False}
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 app = FastAPI(title="Policy Lookup + Dashboard + Team Inbox + WhatsApp Delivery (Single File)")
 
-POLICY_RE = re.compile(r"^[A-Za-z0-9\-\/]+$") # allow common formats
+POLICY_RE = re.compile(r"^[A-Za-z0-9\-\/]+$")  # allow common formats
 PHONE_RE = re.compile(r"^\+?[0-9]{10,15}$")
 
 # WhatsApp Cloud API (Meta Graph)
@@ -71,324 +61,168 @@ OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "25"))
 
 
 class Base(DeclarativeBase):
-  pass
+    pass
 
-
-IST = timezone(timedelta(hours=5, minutes=30))
 
 def now_utc() -> datetime:
-  # Return IST time instead of UTC (name unchanged to avoid breaking anything)
-  return datetime.now(IST)
+    return datetime.utcnow()
 
 
 def get_db():
-  db = SessionLocal()
-  try:
-    yield db
-  finally:
-    db.close()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def send_whatsapp_text(to_number: str, body: str) -> dict:
-  """
-  Sends WhatsApp text message using Meta WhatsApp Cloud API.
-  Returns JSON response from Graph API.
-  """
-  if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-    raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
+    """
+    Sends WhatsApp text message using Meta WhatsApp Cloud API.
+    Returns JSON response from Graph API.
+    """
+    if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
+        raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
 
-  url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-  headers = {
-    "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-    "Content-Type": "application/json",
-  }
-  payload = {
-    "messaging_product": "whatsapp",
-    "to": to_number,
-    "type": "text",
-    "text": {"body": body},
-  }
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {"body": body},
+    }
 
-  r = requests.post(url, headers=headers, json=payload, timeout=30)
-  if r.status_code >= 400:
-    raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
-  return r.json()
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
+    return r.json()
 
 
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
-  """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
+    """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
+    # If no key, skip auto-reply
+    if not OPENAI_API_KEY:
+        return ""
 
-  # Deterministic greeting + menu (ensures menu appears even if the model ignores instructions)
-  txt = (user_text or "").strip().lower()
+    # If message contains a policy number, try a DB lookup and craft a deterministic reply (no hallucinations)
+    if policy_number:
+        policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
+        if policy:
+            # Reuse the same factual composition used by /policy/lookup
+            last_payment = db.execute(
+                select(Payment)
+                .where(Payment.policy_id == policy.id)
+                .order_by(desc(Payment.paid_on), desc(Payment.created_at))
+                .limit(1)
+            ).scalars().first()
 
-  # Deterministic menu routing for option selections (1/2/3)
-  # Normalize common inputs like "1", "1.", "press 1", "option 1"
-  opt = None
-  m_opt = re.search(r"\b([123])\b", txt)
-  if m_opt and txt in {m_opt.group(1), f"{m_opt.group(1)}.", f"press {m_opt.group(1)}", f"option {m_opt.group(1)}"}:
-    opt = m_opt.group(1)
-  # Also accept single-character inputs with whitespace
-  if txt in {"1", "2", "3"}:
-    opt = txt
+            next_due = db.execute(
+                select(PremiumSchedule)
+                .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False)  # noqa: E712
+                .order_by(asc(PremiumSchedule.due_date))
+                .limit(1)
+            ).scalars().first()
 
-  if opt == "1":
-    name = (customer_name or "").strip()
-    prefix = f"Hi {name}, " if name else "Hi, "
-    return (
-      f"{prefix}Nath Investment is a financial firm offering services in LIC and Mutual Funds.\n\n"
-      "✅ LIC Services: New policy guidance, premium due reminders, policy status help, revival support, maturity/claim assistance.\n"
-      "✅ Mutual Funds: SIP & lumpsum guidance, KYC support, portfolio review and general fund selection guidance (no guaranteed returns).\n\n"
-      "If you want, tell me what you’re looking for (LIC or Mutual Funds) and I’ll guide you."
+            next_due_date = next_due.due_date if next_due else policy.next_premium_due_date
+            # Compose a detailed, factual reply from DB (no hallucination)
+            parts = [f"Policy {policy.policy_number} details:"]
+            # Started on
+            if getattr(policy, 'start_date', None):
+                parts.append(f"Started on: {policy.start_date.isoformat()}.")
+            # Total premium paid
+            total_paid = db.execute(
+                select(func.coalesce(func.sum(Payment.amount), 0))
+                .where(Payment.policy_id == policy.id)
+            ).scalar_one()
+            try:
+                total_paid_f = float(total_paid or 0)
+            except Exception:
+                total_paid_f = 0.0
+            parts.append(f"Total premium paid: INR {total_paid_f:,.2f}.")
+            # Remaining premium (sum of unpaid premium schedule, if available)
+            remaining = None
+            try:
+                remaining = db.execute(
+                    select(func.coalesce(func.sum(PremiumSchedule.amount), 0))
+                    .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False)
+                ).scalar_one()
+            except Exception:
+                remaining = None
+            if remaining is not None:
+                try:
+                    remaining_f = float(remaining or 0)
+                    parts.append(f"Remaining premium: INR {remaining_f:,.2f}.")
+                except Exception:
+                    pass
+            # Maturity date
+            if policy.maturity_date:
+                parts.append(f"Maturity date: {policy.maturity_date.isoformat()}.")
+            # Next due + amount
+            if next_due_date:
+                parts.append(f"Next premium due date: {next_due_date.isoformat()}.")
+            if policy.premium_amount is not None:
+                parts.append(f"Premium amount: INR {float(policy.premium_amount):,.2f}.")
+            # Last payment
+            if last_payment and last_payment.paid_on:
+                parts.append(
+                    f"Last payment: {last_payment.paid_on.isoformat()} ({last_payment.status}, INR {float(last_payment.amount):,.2f})."
+                )
+            return " ".join(parts)
+
+    # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
+    system = (
+        "You are a WhatsApp support assistant for an insurance/investment advisory office. "
+        "Be concise and WhatsApp-friendly (1-4 short lines). "
+        "Never fabricate policy status, due dates, maturity amounts, NAVs, or any personalized facts. "
+        "If the user asks for policy-specific info and policy number is missing, ask for the policy number. "
+        "If the user asks for investment advice, give general educational guidance and suggest speaking to a human advisor; no guarantees."
     )
 
+    # Provide a little context to reduce hallucinations
+    context = f"Customer phone: {customer_phone}. Customer name: {customer_name or 'Unknown'}. Extracted policy number: {policy_number or 'None'}."  # not sensitive beyond what WhatsApp already provides
 
-  if opt == "2":
-
-    # Policy details (deterministic, DB-backed)
-
-    if not policy_number:
-
-      return "Sure. Please share your policy number (6–20 digits) to check your policy details."
-
-
-    policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
-
-    if not policy:
-
-      return f"Sorry, no policy found for this policy number: {policy_number}."
-
-
-    # Start date (best-effort)
-
-    start_date = None
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "developer", "content": "If the user says 'hi' or greetings, greet back and ask how you can help."},
+            {"role": "user", "content": f"{context}\n\nUser message: {user_text}"},
+        ],
+        "max_output_tokens": 220,
+    }
 
     try:
-
-      start_date = getattr(policy, "start_date", None) or getattr(policy, "policy_start_date", None)
-
-    except Exception:
-
-      start_date = None
-
-    if not start_date:
-
-      try:
-
-        start_date = getattr(policy, "created_at", None)
-
-      except Exception:
-
-        start_date = None
-
-
-    # Total premium paid
-
-    total_paid = 0.0
-
-    try:
-
-      paid_rows = db.execute(select(Payment).where(Payment.policy_id == policy.id)).scalars().all()
-
-      for p in paid_rows:
-
-        st = (getattr(p, "status", "") or "").upper()
-
-        if st in ("PAID", "SUCCESS", "COMPLETED") or st == "":
-
-          try:
-
-            total_paid += float(getattr(p, "amount", 0) or 0)
-
-          except Exception:
-
-            pass
-
-    except Exception:
-
-      total_paid = 0.0
-
-
-    # Remaining premium (sum unpaid schedules)
-
-    remaining = None
-
-    try:
-
-      unpaid = db.execute(
-
-        select(PremiumSchedule)
-
-        .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False) # noqa: E712
-
-      ).scalars().all()
-
-      if unpaid:
-
-        try:
-
-          remaining = sum(float(getattr(u, "amount", 0) or 0) for u in unpaid)
-
-        except Exception:
-
-          remaining = None
-
-    except Exception:
-
-      remaining = None
-
-
-    maturity_date = getattr(policy, "maturity_date", None)
-
-
-    def _fmt(d):
-
-      try:
-
-        if not d:
-
-          return "Not available"
-
-        if hasattr(d, "date") and hasattr(d, "hour"):
-
-          d = d.date()
-
-        return d.strftime("%d-%b-%Y")
-
-      except Exception:
-
-        return str(d) if d else "Not available"
-
-
-    lines = [
-
-      f"✅ Policy *{policy.policy_number}* details:",
-
-      f"• Started on: *{_fmt(start_date)}*",
-
-      f"• Total premium paid: *₹{total_paid:,.2f}*",
-
-      f"• Remaining premium: *₹{float(remaining):,.2f}*" if remaining is not None else "• Remaining premium: *Not available*",
-
-      f"• Maturity date: *{_fmt(maturity_date)}*",
-
-      "Reply *3* to talk to our human agent.",
-
-    ]
-
-    return "\n".join(lines)
-
-
-  if opt == "3":
-
-    # Human handoff phrase; existing handoff logic in webhook can also detect keywords.
-    return "Sure — connecting you to a human advisor now. Please wait, our team will reply shortly."
-
-  if txt in {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening", "namaste"}:
-    name = (customer_name or "").strip()
-    prefix = f"Hi {name}, " if name else "Hi, "
-    return (
-      f"👋 {prefix}welcome to *Nath Investment*! I am *Shashinath Thakur*. How can I help you today?\n\n"
-      "Please choose an option 👇\n\n"
-      "🟢 1️⃣ *About Nath Investments & our services*\n"
-      "🔵 2️⃣ *Know your policy details*\n"
-      "🟠 3️⃣ *Talk to our human agent*"
-    )
-  # If no key, skip auto-reply
-  if not OPENAI_API_KEY:
-    return ""
-
-  # If message contains a policy number, try a DB lookup and craft a deterministic reply (no hallucinations)
-  if policy_number:
-    policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
-    if policy:
-      # Reuse the same factual composition used by /policy/lookup
-      last_payment = db.execute(
-        select(Payment)
-        .where(Payment.policy_id == policy.id)
-        .order_by(desc(Payment.paid_on), desc(Payment.created_at))
-        .limit(1)
-      ).scalars().first()
-
-      next_due = db.execute(
-        select(PremiumSchedule)
-        .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False) # noqa: E712
-        .order_by(asc(PremiumSchedule.due_date))
-        .limit(1)
-      ).scalars().first()
-
-      next_due_date = next_due.due_date if next_due else policy.next_premium_due_date
-
-      parts = [f"Policy {policy.policy_number} status: {policy.status}."]
-
-      if next_due_date:
-        parts.append(f"Next premium due date: {next_due_date.isoformat()}.")
-      if policy.premium_amount is not None:
-        parts.append(f"Premium amount: ₹{float(policy.premium_amount):,.2f}.")
-      if policy.maturity_date:
-        parts.append(f"Maturity date: {policy.maturity_date.isoformat()}.")
-      if policy.maturity_amount_expected is not None:
-        parts.append(f"Expected maturity amount: ₹{float(policy.maturity_amount_expected):,.2f}.")
-      if last_payment:
-        parts.append(
-          f"Last payment: {last_payment.paid_on.isoformat()} ({last_payment.status}, ₹{float(last_payment.amount):,.2f})."
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=OPENAI_TIMEOUT,
         )
-
-      # Add a short closing line
-      parts.append("")
-      return " ".join(parts)
-
-  # Otherwise: OpenAI for general guidance + clarification questions (no personalized facts)
-  system = (
-    "You are the official WhatsApp assistant for Nath Investments, a financial firm offering services in LIC and mutual funds. More details may be provided later (e.g., via a PPT). "
-    "Be concise and WhatsApp-friendly (1-4 short lines). "
-    "Answer questions about Nath Investments: services, onboarding, documents needed, office hours, process, fees in general terms. "
-    "Never fabricate policy status, due dates, maturity amounts, NAVs, returns, guarantees, or any personalized facts. "
-    "If the user asks for policy-specific info and policy number is missing, ask for the policy number. "
-    "If the user asks for investment advice, give general educational guidance and suggest speaking to a human advisor; no guarantees. "
-    "If the user asks to talk to a human/agent, confirm handoff and tell them an agent will reply shortly."
-  )
-
-  # Provide a little context to reduce hallucinations
-  context = f"Customer phone: {customer_phone}. Customer name: {customer_name or 'Unknown'}. Extracted policy number: {policy_number or 'None'}." # not sensitive beyond what WhatsApp already provides
-
-  payload = {
-    "model": OPENAI_MODEL,
-    "input": [
-      {"role": "system", "content": system},
-      {"role": "developer", "content": "If the user says 'hi' or greetings, greet back and ask how you can help."},
-      {"role": "user", "content": f"{context}\n\nUser message: {user_text}"},
-    ],
-    "max_output_tokens": 220,
-  }
-
-  try:
-    r = requests.post(
-      "https://api.openai.com/v1/responses",
-      headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-      json=payload,
-      timeout=OPENAI_TIMEOUT,
-    )
-    if r.status_code >= 400:
-      return ""
-    data = r.json()
-    # Responses API returns output_text in some SDKs; with raw HTTP, parse safely
-    out_text = ""
-    if isinstance(data, dict):
-      # try common shapes
-      if "output_text" in data and isinstance(data["output_text"], str):
-        out_text = data["output_text"]
-      else:
-        # traverse output -> content -> text
-        for item in data.get("output", []) or []:
-          for c in item.get("content", []) or []:
-            if c.get("type") == "output_text" and isinstance(c.get("text"), str):
-              out_text += c.get("text")
-            elif c.get("type") == "text" and isinstance(c.get("text"), str):
-              out_text += c.get("text")
-    out_text = (out_text or "").strip()
-    return out_text[:1200]
-  except Exception:
-    return ""
+        if r.status_code >= 400:
+            return ""
+        data = r.json()
+        # Responses API returns output_text in some SDKs; with raw HTTP, parse safely
+        out_text = ""
+        if isinstance(data, dict):
+            # try common shapes
+            if "output_text" in data and isinstance(data["output_text"], str):
+                out_text = data["output_text"]
+            else:
+                # traverse output -> content -> text
+                for item in data.get("output", []) or []:
+                    for c in item.get("content", []) or []:
+                        if c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                            out_text += c.get("text")
+                        elif c.get("type") == "text" and isinstance(c.get("text"), str):
+                            out_text += c.get("text")
+        out_text = (out_text or "").strip()
+        return out_text[:1200]
+    except Exception:
+        return ""
 
 
 # =========================================================
@@ -397,222 +231,157 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 # =========================================================
 
 class Customer(Base):
-  __tablename__ = "customers"
+    __tablename__ = "customers"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  full_name = Column(Text, nullable=False)
-  phone_e164 = Column(Text, unique=True, index=True, nullable=True)
-  email = Column(Text, nullable=True)
-  dob = Column(Date, nullable=True)
-  pan_last4 = Column(String(4), nullable=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    full_name = Column(Text, nullable=False)
+    phone_e164 = Column(Text, unique=True, index=True, nullable=True)
+    email = Column(Text, nullable=True)
+    dob = Column(Date, nullable=True)
+    pan_last4 = Column(String(4), nullable=True)
 
-  created_at = Column(DateTime, default=now_utc, nullable=False)
-  updated_at = Column(DateTime, default=now_utc, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, nullable=False)
 
-  policies = relationship("Policy", back_populates="customer")
+    policies = relationship("Policy", back_populates="customer")
 
 
 class Policy(Base):
-  __tablename__ = "policies"
+    __tablename__ = "policies"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  carrier = Column(Text, nullable=False, default="LIC")
-  policy_number = Column(Text, unique=True, nullable=False, index=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    carrier = Column(Text, nullable=False, default="LIC")
+    policy_number = Column(Text, unique=True, nullable=False, index=True)
 
-  customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
 
-  plan_name = Column(Text, nullable=True)
-  plan_code = Column(Text, nullable=True)
-  status = Column(Text, nullable=False, default="ACTIVE") # ACTIVE/LAPSED/MATURED/etc.
+    plan_name = Column(Text, nullable=True)
+    plan_code = Column(Text, nullable=True)
+    status = Column(Text, nullable=False, default="ACTIVE")  # ACTIVE/LAPSED/MATURED/etc.
 
-  start_date = Column(Date, nullable=False)
-  end_date = Column(Date, nullable=True)
-  maturity_date = Column(Date, nullable=True)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=True)
+    maturity_date = Column(Date, nullable=True)
 
-  sum_assured = Column(Numeric(14, 2), nullable=True)
-  maturity_amount_expected = Column(Numeric(14, 2), nullable=True)
+    sum_assured = Column(Numeric(14, 2), nullable=True)
+    maturity_amount_expected = Column(Numeric(14, 2), nullable=True)
 
-  premium_amount = Column(Numeric(14, 2), nullable=True)
-  premium_frequency = Column(Text, nullable=False, default="YEARLY") # MONTHLY/...
-  next_premium_due_date = Column(Date, nullable=True)
-  grace_period_days = Column(String, nullable=True, default="30")
+    premium_amount = Column(Numeric(14, 2), nullable=True)
+    premium_frequency = Column(Text, nullable=False, default="YEARLY")  # MONTHLY/...
+    next_premium_due_date = Column(Date, nullable=True)
+    grace_period_days = Column(String, nullable=True, default="30")
 
-  nominee_name = Column(Text, nullable=True)
-  nominee_relation = Column(Text, nullable=True)
+    nominee_name = Column(Text, nullable=True)
+    nominee_relation = Column(Text, nullable=True)
 
-  created_at = Column(DateTime, default=now_utc, nullable=False)
-  updated_at = Column(DateTime, default=now_utc, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, nullable=False)
 
-  customer = relationship("Customer", back_populates="policies")
-  payments = relationship("Payment", back_populates="policy", cascade="all, delete-orphan")
-  schedule = relationship("PremiumSchedule", back_populates="policy", cascade="all, delete-orphan")
+    customer = relationship("Customer", back_populates="policies")
+    payments = relationship("Payment", back_populates="policy", cascade="all, delete-orphan")
+    schedule = relationship("PremiumSchedule", back_populates="policy", cascade="all, delete-orphan")
 
 
 class PremiumSchedule(Base):
-  __tablename__ = "premium_schedule"
+    __tablename__ = "premium_schedule"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  policy_id = Column(String, ForeignKey("policies.id"), nullable=False, index=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    policy_id = Column(String, ForeignKey("policies.id"), nullable=False, index=True)
 
-  due_date = Column(Date, nullable=False)
-  amount = Column(Numeric(14, 2), nullable=False)
-  is_paid = Column(Boolean, nullable=False, default=False)
-  paid_on = Column(Date, nullable=True)
+    due_date = Column(Date, nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
+    is_paid = Column(Boolean, nullable=False, default=False)
+    paid_on = Column(Date, nullable=True)
 
-  created_at = Column(DateTime, default=now_utc, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
-  policy = relationship("Policy", back_populates="schedule")
+    policy = relationship("Policy", back_populates="schedule")
 
 
 class Payment(Base):
-  __tablename__ = "payments"
+    __tablename__ = "payments"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  policy_id = Column(String, ForeignKey("policies.id"), nullable=False, index=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    policy_id = Column(String, ForeignKey("policies.id"), nullable=False, index=True)
 
-  paid_on = Column(Date, nullable=False)
-  amount = Column(Numeric(14, 2), nullable=False)
-  status = Column(Text, nullable=False, default="SUCCESS") # SUCCESS/FAILED/PENDING/REVERSED
+    paid_on = Column(Date, nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
+    status = Column(Text, nullable=False, default="SUCCESS")  # SUCCESS/FAILED/PENDING/REVERSED
 
-  reference_id = Column(Text, nullable=True)
-  method = Column(Text, nullable=True)
-  notes = Column(Text, nullable=True)
+    reference_id = Column(Text, nullable=True)
+    method = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)
 
-  created_at = Column(DateTime, default=now_utc, nullable=False)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
-  policy = relationship("Policy", back_populates="payments")
+    policy = relationship("Policy", back_populates="payments")
 
 
 class AuditLog(Base):
-  __tablename__ = "audit_logs"
+    __tablename__ = "audit_logs"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  actor_user_id = Column(Text, nullable=True)
-  channel = Column(Text, nullable=False, default="WHATSAPP") # WHATSAPP/WEB/VOICE
-  request_id = Column(Text, nullable=True)
-  action = Column(Text, nullable=False, default="POLICY_LOOKUP")
-  policy_number = Column(Text, nullable=True)
-  customer_phone = Column(Text, nullable=True)
-  success = Column(Boolean, nullable=False, default=False)
-  reason = Column(Text, nullable=True)
-  created_at = Column(DateTime, default=now_utc, nullable=False)
-
-
-def _fmt_date_ist(d: date | None) -> str:
-  if not d:
-    return "Not available"
-  try:
-    return d.strftime("%d-%b-%Y")
-  except Exception:
-    return str(d)
-
-def _premium_reminder_message(*, policy_number: str, due_date: date | None, amount: float | None) -> str:
-  amt = f"₹{float(amount):,.2f}" if amount is not None else "Not available"
-  dd = _fmt_date_ist(due_date)
-  return (
-    "🔔 *Premium Reminder*\n\n"
-    f"Policy No: *{policy_number}*\n"
-    f"Premium Due Date: *{dd}*\n"
-    f"Premium Amount: *{amt}*\n\n"
-    "Reply *2* to check policy details, or reply *3* to talk to our human agent."
-  )
-
-def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_name: str | None, policy_number: str | None):
-  conv = db.execute(
-    select(InboxConversation)
-    .where(
-      InboxConversation.channel == "WHATSAPP",
-      InboxConversation.customer_phone == customer_phone,
-      InboxConversation.status != "CLOSED",
-    )
-    .order_by(desc(InboxConversation.last_message_at))
-    .limit(1)
-  ).scalars().first()
-  if not conv:
-    conv = InboxConversation(
-      channel="WHATSAPP",
-      customer_phone=customer_phone,
-      customer_name=customer_name,
-      policy_number=policy_number,
-      status="OPEN",
-      priority="NORMAL",
-      last_message_at=now_utc(),
-      updated_at=now_utc(),
-    )
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
-  return conv
-
-def _already_reminded_today(db: Session, *, policy_number: str, due_date: date | None, customer_phone: str) -> bool:
-  today = now_utc().date()
-  sig = f"DUE:{due_date.isoformat() if due_date else 'NA'}"
-  row = db.execute(
-    select(AuditLog)
-    .where(
-      AuditLog.action == "PREMIUM_REMINDER",
-      AuditLog.policy_number == policy_number,
-      AuditLog.customer_phone == customer_phone,
-      AuditLog.created_at >= datetime.combine(today, datetime.min.time(), tzinfo=IST),
-    )
-    .order_by(desc(AuditLog.created_at))
-    .limit(1)
-  ).scalars().first()
-  if not row:
-    return False
-  return (row.reason or "").find(sig) >= 0
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    actor_user_id = Column(Text, nullable=True)
+    channel = Column(Text, nullable=False, default="WHATSAPP")  # WHATSAPP/WEB/VOICE
+    request_id = Column(Text, nullable=True)
+    action = Column(Text, nullable=False, default="POLICY_LOOKUP")
+    policy_number = Column(Text, nullable=True)
+    customer_phone = Column(Text, nullable=True)
+    success = Column(Boolean, nullable=False, default=False)
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
 
 # -------- Team Inbox: users, conversations, messages --------
 
 class TeamUser(Base):
-  __tablename__ = "team_users"
+    __tablename__ = "team_users"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  role = Column(Text, nullable=False, default="agent") # admin/agent
-  full_name = Column(Text, nullable=False)
-  is_active = Column(Boolean, nullable=False, default=True)
-  created_at = Column(DateTime, default=now_utc, nullable=False)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    role = Column(Text, nullable=False, default="agent")  # admin/agent
+    full_name = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
 
 
 class InboxConversation(Base):
-  __tablename__ = "inbox_conversations"
+    __tablename__ = "inbox_conversations"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  channel = Column(Text, nullable=False, default="WHATSAPP")
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    channel = Column(Text, nullable=False, default="WHATSAPP")
 
-  customer_phone = Column(Text, nullable=False, index=True)
-  customer_name = Column(Text, nullable=True)
+    customer_phone = Column(Text, nullable=False, index=True)
+    customer_name = Column(Text, nullable=True)
 
-  policy_number = Column(Text, nullable=True, index=True)
+    policy_number = Column(Text, nullable=True, index=True)
 
-  status = Column(Text, nullable=False, default="OPEN") # OPEN/PENDING/CLOSED
-  priority = Column(Text, nullable=False, default="NORMAL") # LOW/NORMAL/HIGH
+    status = Column(Text, nullable=False, default="OPEN")  # OPEN/PENDING/CLOSED
+    priority = Column(Text, nullable=False, default="NORMAL")  # LOW/NORMAL/HIGH
 
-  assigned_to_user_id = Column(String, ForeignKey("team_users.id"), nullable=True)
+    assigned_to_user_id = Column(String, ForeignKey("team_users.id"), nullable=True)
 
-  last_message_at = Column(DateTime, default=now_utc, nullable=False, index=True)
-  created_at = Column(DateTime, default=now_utc, nullable=False)
-  updated_at = Column(DateTime, default=now_utc, nullable=False)
+    last_message_at = Column(DateTime, default=now_utc, nullable=False, index=True)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, nullable=False)
 
-  assigned_to = relationship("TeamUser")
-  messages = relationship("InboxMessage", back_populates="conversation", cascade="all, delete-orphan")
+    assigned_to = relationship("TeamUser")
+    messages = relationship("InboxMessage", back_populates="conversation", cascade="all, delete-orphan")
 
 
 class InboxMessage(Base):
-  __tablename__ = "inbox_messages"
+    __tablename__ = "inbox_messages"
 
-  id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-  conversation_id = Column(String, ForeignKey("inbox_conversations.id"), nullable=False, index=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id = Column(String, ForeignKey("inbox_conversations.id"), nullable=False, index=True)
 
-  direction = Column(Text, nullable=False, default="IN") # IN/OUT/NOTE
-  body = Column(Text, nullable=False)
+    direction = Column(Text, nullable=False, default="IN")  # IN/OUT/NOTE
+    body = Column(Text, nullable=False)
 
-  actor_user_id = Column(String, ForeignKey("team_users.id"), nullable=True) # for OUT/NOTE
-  created_at = Column(DateTime, default=now_utc, nullable=False, index=True)
+    actor_user_id = Column(String, ForeignKey("team_users.id"), nullable=True)  # for OUT/NOTE
+    created_at = Column(DateTime, default=now_utc, nullable=False, index=True)
 
-  conversation = relationship("InboxConversation", back_populates="messages")
-  actor = relationship("TeamUser")
+    conversation = relationship("InboxConversation", back_populates="messages")
+    actor = relationship("TeamUser")
 
 
 # =========================================================
@@ -620,44 +389,44 @@ class InboxMessage(Base):
 # =========================================================
 
 class PolicyLookupRequest(BaseModel):
-  policy_number: str = Field(..., min_length=4, max_length=40)
-  customer_phone_e164: Optional[str] = Field(default=None, max_length=20)
-  channel: str = Field(default="WHATSAPP")
-  request_id: Optional[str] = None
+    policy_number: str = Field(..., min_length=4, max_length=40)
+    customer_phone_e164: Optional[str] = Field(default=None, max_length=20)
+    channel: str = Field(default="WHATSAPP")
+    request_id: Optional[str] = None
 
 
 class PolicyLookupResponse(BaseModel):
-  found: bool
-  policy_number: Optional[str] = None
-  carrier: Optional[str] = None
-  status: Optional[str] = None
-  plan_name: Optional[str] = None
+    found: bool
+    policy_number: Optional[str] = None
+    carrier: Optional[str] = None
+    status: Optional[str] = None
+    plan_name: Optional[str] = None
 
-  premium_amount: Optional[float] = None
-  next_premium_due_date: Optional[date] = None
-  grace_period_days: Optional[int] = None
+    premium_amount: Optional[float] = None
+    next_premium_due_date: Optional[date] = None
+    grace_period_days: Optional[int] = None
 
-  maturity_date: Optional[date] = None
-  maturity_amount_expected: Optional[float] = None
-  sum_assured: Optional[float] = None
+    maturity_date: Optional[date] = None
+    maturity_amount_expected: Optional[float] = None
+    sum_assured: Optional[float] = None
 
-  last_payment_date: Optional[date] = None
-  last_payment_amount: Optional[float] = None
-  last_payment_status: Optional[str] = None
+    last_payment_date: Optional[date] = None
+    last_payment_amount: Optional[float] = None
+    last_payment_status: Optional[str] = None
 
-  message: str
+    message: str
 
 
 class InboxSendRequest(BaseModel):
-  actor_user_id: Optional[str] = None
-  direction: str = Field(default="OUT") # OUT or NOTE
-  body: str = Field(..., min_length=1, max_length=4000)
+    actor_user_id: Optional[str] = None
+    direction: str = Field(default="OUT")  # OUT or NOTE
+    body: str = Field(..., min_length=1, max_length=4000)
 
 
 class InboxAssignRequest(BaseModel):
-  assigned_to_user_id: Optional[str] = None # None = unassign
-  status: Optional[str] = None # OPEN/PENDING/CLOSED
-  priority: Optional[str] = None # LOW/NORMAL/HIGH
+    assigned_to_user_id: Optional[str] = None  # None = unassign
+    status: Optional[str] = None  # OPEN/PENDING/CLOSED
+    priority: Optional[str] = None  # LOW/NORMAL/HIGH
 
 
 # =========================================================
@@ -665,45 +434,45 @@ class InboxAssignRequest(BaseModel):
 # =========================================================
 
 def audit(
-  db: Session,
-  *,
-  channel: str,
-  request_id: Optional[str],
-  action: str,
-  policy_number: Optional[str],
-  customer_phone: Optional[str],
-  success: bool,
-  reason: Optional[str],
-  actor_user_id: Optional[str] = None,
+    db: Session,
+    *,
+    channel: str,
+    request_id: Optional[str],
+    action: str,
+    policy_number: Optional[str],
+    customer_phone: Optional[str],
+    success: bool,
+    reason: Optional[str],
+    actor_user_id: Optional[str] = None,
 ):
-  db.add(
-    AuditLog(
-      channel=channel,
-      request_id=request_id,
-      action=action,
-      policy_number=policy_number,
-      customer_phone=customer_phone,
-      success=success,
-      reason=reason,
-      actor_user_id=actor_user_id,
+    db.add(
+        AuditLog(
+            channel=channel,
+            request_id=request_id,
+            action=action,
+            policy_number=policy_number,
+            customer_phone=customer_phone,
+            success=success,
+            reason=reason,
+            actor_user_id=actor_user_id,
+        )
     )
-  )
-  db.commit()
+    db.commit()
 
 
 def money(v):
-  return float(v) if v is not None else None
+    return float(v) if v is not None else None
 
 
 def seed_team_if_empty(db: Session):
-  count = db.execute(select(func.count(TeamUser.id))).scalar_one()
-  if count and int(count) > 0:
-    return
-  admin = TeamUser(role="admin", full_name="Admin", is_active=True)
-  a1 = TeamUser(role="agent", full_name="Agent 1", is_active=True)
-  a2 = TeamUser(role="agent", full_name="Agent 2", is_active=True)
-  db.add_all([admin, a1, a2])
-  db.commit()
+    count = db.execute(select(func.count(TeamUser.id))).scalar_one()
+    if count and int(count) > 0:
+        return
+    admin = TeamUser(role="admin", full_name="Admin", is_active=True)
+    a1 = TeamUser(role="agent", full_name="Agent 1", is_active=True)
+    a2 = TeamUser(role="agent", full_name="Agent 2", is_active=True)
+    db.add_all([admin, a1, a2])
+    db.commit()
 
 
 # =========================================================
@@ -712,9 +481,9 @@ def seed_team_if_empty(db: Session):
 
 @app.on_event("startup")
 def on_startup():
-  Base.metadata.create_all(bind=engine)
-  with SessionLocal() as db:
-    seed_team_if_empty(db)
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        seed_team_if_empty(db)
 
 
 # =========================================================
@@ -723,263 +492,208 @@ def on_startup():
 
 @app.get("/webhook")
 def whatsapp_verify(request: Request):
-  """
-  Meta webhook verification handshake:
-  GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
-  """
-  mode = request.query_params.get("hub.mode")
-  token = request.query_params.get("hub.verify_token")
-  challenge = request.query_params.get("hub.challenge")
+    """
+    Meta webhook verification handshake:
+    GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+    """
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
 
-  if mode == "subscribe" and token and token == WHATSAPP_VERIFY_TOKEN:
-    return HTMLResponse(content=str(challenge), status_code=200)
+    if mode == "subscribe" and token and token == WHATSAPP_VERIFY_TOKEN:
+        return HTMLResponse(content=str(challenge), status_code=200)
 
-  return HTMLResponse(content="Verification failed", status_code=403)
+    return HTMLResponse(content="Verification failed", status_code=403)
 
 
 @app.post("/webhook")
 async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
-  """
-  Receives WhatsApp webhook payloads and ingests messages into Team Inbox.
-  Auto-reply (OpenAI) is enabled below; everything else stays the same.
-  """
-  print(">>> META POST /webhook HIT <<<")
+    """
+    Receives WhatsApp webhook payloads and ingests messages into Team Inbox.
+    Auto-reply (OpenAI) is enabled below; everything else stays the same.
+    """
+    print(">>> META POST /webhook HIT <<<")
 
-  data = await request.json()
+    data = await request.json()
 
-  handled = 0
+    handled = 0
 
-  try:
-    # WhatsApp payloads can contain multiple entries/changes/messages
-    for _entry in (data.get("entry") or []):
-      for _change in (_entry.get("changes") or []):
-        entry = (_change.get("value") or {}) # keep variable name "entry"
+    try:
+        # WhatsApp payloads can contain multiple entries/changes/messages
+        for _entry in (data.get("entry") or []):
+            for _change in (_entry.get("changes") or []):
+                entry = (_change.get("value") or {})  # keep variable name "entry"
 
-        # Ignore status callbacks; only handle inbound messages
-        if "messages" not in entry:
-          continue
+                # Ignore status callbacks; only handle inbound messages
+                if "messages" not in entry:
+                    continue
 
-        for msg in (entry.get("messages") or []): # keep variable name "msg"
-          from_number = msg.get("from") # often without "+"
-          if not from_number:
-            continue
+                for msg in (entry.get("messages") or []):  # keep variable name "msg"
+                    from_number = msg.get("from")  # often without "+"
+                    if not from_number:
+                        continue
 
-          if msg.get("type") == "text":
-            text_body = msg.get("text", {}).get("body", "")
-          else:
-            text_body = f"[{msg.get('type', 'unknown')} message received]"
+                    if msg.get("type") == "text":
+                        text_body = msg.get("text", {}).get("body", "")
+                    else:
+                        text_body = f"[{msg.get('type', 'unknown')} message received]"
 
-          # Normalize to E.164-like: add + if missing
-          customer_phone = from_number if from_number.startswith("+") else f"+{from_number}"
+                    # Normalize to E.164-like: add + if missing
+                    customer_phone = from_number if from_number.startswith("+") else f"+{from_number}"
 
-          # Try to pull name if provided in contacts
-          customer_name = None
-          if "contacts" in entry and entry["contacts"]:
-            customer_name = entry["contacts"][0].get("profile", {}).get("name")
+                    # Try to pull name if provided in contacts
+                    customer_name = None
+                    if "contacts" in entry and entry["contacts"]:
+                        customer_name = entry["contacts"][0].get("profile", {}).get("name")
+                    # OPTIONAL: extract policy number from message text (basic)
+                    policy_number = None
+                    m = re.search(r"\b(\d{6,20})\b", text_body or "")
+                    if m:
+                        cand = m.group(1)
+                        phone_digits = re.sub(r"\D", "", customer_phone or "")
+                        # Avoid treating the customer's phone number as a policy number
+                        if cand != phone_digits and (len(phone_digits) < 10 or cand != phone_digits[-10:]):
+                            policy_number = cand
 
-          # OPTIONAL: extract policy number from message text (basic)
-          policy_number = None
-          m = re.search(r"\b(\d{6,20})\b", text_body or "")
-          if m:
-            policy_number = m.group(1)
+                    # find existing conversation by channel + phone that is not CLOSED (prefer open)
+                    conv = db.execute(
+                        select(InboxConversation)
+                        .where(
+                            InboxConversation.channel == "WHATSAPP",
+                            InboxConversation.customer_phone == customer_phone,
+                            InboxConversation.status != "CLOSED",
+                        )
+                        .order_by(desc(InboxConversation.last_message_at))
+                        .limit(1)
+                    ).scalars().first()
 
-          # ADD: avoid mistaking phone number as policy number
-          try:
-            if policy_number:
-              digits_phone = re.sub(r"\D", "", customer_phone or "")
-              digits_pol = re.sub(r"\D", "", str(policy_number))
-              # If extracted number equals the customer phone (or last 10 digits), treat it as phone, not policy
-              if digits_phone and digits_pol and (digits_pol == digits_phone or digits_pol == digits_phone[-10:]):
-                policy_number = None
-          except Exception:
-            pass
+                    if not conv:
+                        conv = InboxConversation(
+                            channel="WHATSAPP",
+                            customer_phone=customer_phone,
+                            customer_name=customer_name,
+                            policy_number=None,
+                            status="OPEN",
+                            priority="NORMAL",
+                            last_message_at=now_utc(),
+                            updated_at=now_utc(),
+                        )
+                        db.add(conv)
+                        db.commit()
+                        db.refresh(conv)
 
+                    # update conv fields if new info appears
+                    if customer_name and not conv.customer_name:
+                        conv.customer_name = customer_name
 
-          # find existing conversation by channel + phone that is not CLOSED (prefer open)
-          conv = db.execute(
-            select(InboxConversation)
-            .where(
-              InboxConversation.channel == "WHATSAPP",
-              InboxConversation.customer_phone == customer_phone,
-              InboxConversation.status != "CLOSED",
-            )
-            .order_by(desc(InboxConversation.last_message_at))
-            .limit(1)
-          ).scalars().first()
+                    conv.last_message_at = now_utc()
+                    conv.updated_at = now_utc()
 
-          if not conv:
-            conv = InboxConversation(
-              channel="WHATSAPP",
-              customer_phone=customer_phone,
-              customer_name=customer_name,
-              policy_number=policy_number,
-              status="OPEN",
-              priority="NORMAL",
-              last_message_at=now_utc(),
-              updated_at=now_utc(),
-            )
-            db.add(conv)
-            db.commit()
-            db.refresh(conv)
-
-          # update conv fields if new info appears
-          if customer_name and not conv.customer_name:
-            conv.customer_name = customer_name
-          if policy_number and not conv.policy_number:
-            conv.policy_number = policy_number
-
-          conv.last_message_at = now_utc()
-          conv.updated_at = now_utc()
-
-          db.add(
-            InboxMessage(
-              conversation_id=conv.id,
-              direction="IN",
-              body=text_body or "[empty]",
-              actor_user_id=None,
-              created_at=now_utc(),
-            )
-          )
-
-          audit(
-            db,
-            channel="WHATSAPP",
-            request_id=None,
-            action="INBOX_INGEST",
-            policy_number=policy_number,
-            customer_phone=customer_phone,
-            success=True,
-            reason=None,
-          )
-
-          db.commit()
-          handled += 1
-
-          # Auto-reply (OpenAI) - keep everything else the same
-          try:
-            if (msg.get("type") == "text") and (text_body or "").strip():
-              user_clean = (text_body or "").strip()
-
-              # Human handoff: if user asks for an agent/human, mark conversation PENDING and notify
-              if re.search(r"(agent|human|representative|advisor|support|call me|callback|talk to|speak to)", user_clean, flags=re.I):
-                try:
-                  conv.status = "PENDING"
-                  conv.updated_at = now_utc()
-                  conv.last_message_at = now_utc()
-                  handoff_msg = "Sure — I’m connecting you to a human advisor at Nath Investments. An agent will reply shortly."
-
-                  # Deliver to WhatsApp
-                  send_whatsapp_text(customer_phone, handoff_msg)
-
-                  # Store OUT message in the same conversation thread
-                  db.add(
-                    InboxMessage(
-                      conversation_id=conv.id,
-                      direction="OUT",
-                      body=handoff_msg,
-                      actor_user_id=None,
-                      created_at=now_utc(),
+                    db.add(
+                        InboxMessage(
+                            conversation_id=conv.id,
+                            direction="IN",
+                            body=text_body or "[empty]",
+                            actor_user_id=None,
+                            created_at=now_utc(),
+                        )
                     )
-                  )
-                  conv.last_message_at = now_utc()
-                  conv.updated_at = now_utc()
 
-                  audit(
-                    db,
-                    channel="WHATSAPP",
-                    request_id=None,
-                    action="HUMAN_HANDOFF",
-                    policy_number=policy_number,
-                    customer_phone=customer_phone,
-                    success=True,
-                    reason=None,
-                  )
-                  db.commit()
-                except Exception:
-                  # Never fail the webhook for handoff
-                  try:
+                    audit(
+                        db,
+                        channel="WHATSAPP",
+                        request_id=None,
+                        action="INBOX_INGEST",
+                        policy_number=None,
+                        customer_phone=customer_phone,
+                        success=True,
+                        reason=None,
+                    )
+
                     db.commit()
-                  except Exception:
-                    pass
-              else:
-                reply = openai_generate_reply(
-                customer_phone=customer_phone,
-                customer_name=customer_name,
-                user_text=(text_body or "").strip(),
-                policy_number=policy_number,
-                db=db,
-              )
-              if reply:
-                # Deliver to WhatsApp
-                send_whatsapp_text(customer_phone, reply)
+                    handled += 1
 
-                # Store OUT message in the same conversation thread
-                db.add(
-                  InboxMessage(
-                    conversation_id=conv.id,
-                    direction="OUT",
-                    body=reply,
-                    actor_user_id=None,
-                    created_at=now_utc(),
-                  )
-                )
-                conv.last_message_at = now_utc()
-                conv.updated_at = now_utc()
+                    # Auto-reply (OpenAI) - keep everything else the same
+                    try:
+                        if (msg.get("type") == "text") and (text_body or "").strip():
+                            reply = openai_generate_reply(
+                                customer_phone=customer_phone,
+                                customer_name=customer_name,
+                                user_text=(text_body or "").strip(),
+                                policy_number=None,
+                                db=db,
+                            )
+                            if reply:
+                                # Deliver to WhatsApp
+                                send_whatsapp_text(customer_phone, reply)
 
-                audit(
-                  db,
-                  channel="WHATSAPP",
-                  request_id=None,
-                  action="AUTO_REPLY",
-                  policy_number=policy_number,
-                  customer_phone=customer_phone,
-                  success=True,
-                  reason=None,
-                )
-                db.commit()
-          except Exception as _e:
-            # Never fail the webhook; just record a short audit note
-            try:
-              audit(
+                                # Store OUT message in the same conversation thread
+                                db.add(
+                                    InboxMessage(
+                                        conversation_id=conv.id,
+                                        direction="OUT",
+                                        body=reply,
+                                        actor_user_id=None,
+                                        created_at=now_utc(),
+                                    )
+                                )
+                                conv.last_message_at = now_utc()
+                                conv.updated_at = now_utc()
+
+                                audit(
+                                    db,
+                                    channel="WHATSAPP",
+                                    request_id=None,
+                                    action="AUTO_REPLY",
+                                    policy_number=None,
+                                    customer_phone=customer_phone,
+                                    success=True,
+                                    reason=None,
+                                )
+                                db.commit()
+                    except Exception as _e:
+                        # Never fail the webhook; just record a short audit note
+                        try:
+                            audit(
+                                db,
+                                channel="WHATSAPP",
+                                request_id=None,
+                                action="AUTO_REPLY",
+                                policy_number=None,
+                                customer_phone=customer_phone,
+                                success=False,
+                                reason=str(_e)[:250],
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            db.commit()
+                        except Exception:
+                            pass
+
+        # Even if we handled nothing (statuses-only payload), return OK
+        return {"ok": True, "handled": handled}
+
+    except Exception as e:
+        # log failure but don't error to Meta
+        try:
+            audit(
                 db,
                 channel="WHATSAPP",
                 request_id=None,
-                action="AUTO_REPLY",
-                policy_number=policy_number,
-                customer_phone=customer_phone,
+                action="INBOX_INGEST",
+                policy_number=None,
+                customer_phone=None,
                 success=False,
-                reason=str(_e)[:250],
-              )
-            except Exception:
-              pass
+                reason=str(e)[:250],
+            )
             try:
-              db.commit()
+                db.commit()
             except Exception:
-              pass
-
-    # Even if we handled nothing (statuses-only payload), return OK
-    return {"ok": True, "handled": handled}
-
-  except Exception as e:
-    # log failure but don't error to Meta
-    try:
-      audit(
-        db,
-        channel="WHATSAPP",
-        request_id=None,
-        action="INBOX_INGEST",
-        policy_number=None,
-        customer_phone=None,
-        success=False,
-        reason=str(e)[:250],
-      )
-      try:
-        db.commit()
-      except Exception:
-        pass
-    except Exception:
-      pass
-    return {"ok": True, "handled": handled}
+                pass
+        except Exception:
+            pass
+        return {"ok": True, "handled": handled}
 
 
 # =========================================================
@@ -988,109 +702,109 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/policy/lookup", response_model=PolicyLookupResponse)
 def policy_lookup(payload: PolicyLookupRequest, db: Session = Depends(get_db)):
-  pn = payload.policy_number.strip()
+    pn = payload.policy_number.strip()
 
-  if not POLICY_RE.match(pn):
+    if not POLICY_RE.match(pn):
+        audit(
+            db,
+            channel=payload.channel,
+            request_id=payload.request_id,
+            action="POLICY_LOOKUP",
+            policy_number=pn,
+            customer_phone=payload.customer_phone_e164,
+            success=False,
+            reason="INVALID_POLICY_FORMAT",
+        )
+        raise HTTPException(status_code=400, detail="Invalid policy number format.")
+
+    policy = db.execute(select(Policy).where(Policy.policy_number == pn)).scalars().first()
+
+    if not policy:
+        audit(
+            db,
+            channel=payload.channel,
+            request_id=payload.request_id,
+            action="POLICY_LOOKUP",
+            policy_number=pn,
+            customer_phone=payload.customer_phone_e164,
+            success=False,
+            reason="NOT_FOUND",
+        )
+        return PolicyLookupResponse(found=False, message="Policy not found. Please verify the policy number.")
+
+    if payload.customer_phone_e164 and policy.customer and policy.customer.phone_e164:
+        if payload.customer_phone_e164.strip() != policy.customer.phone_e164.strip():
+            audit(
+                db,
+                channel=payload.channel,
+                request_id=payload.request_id,
+                action="POLICY_LOOKUP",
+                policy_number=pn,
+                customer_phone=payload.customer_phone_e164,
+                success=False,
+                reason="PHONE_MISMATCH",
+            )
+            raise HTTPException(status_code=403, detail="Verification failed (phone mismatch).")
+
+    last_payment = db.execute(
+        select(Payment)
+        .where(Payment.policy_id == policy.id)
+        .order_by(desc(Payment.paid_on), desc(Payment.created_at))
+        .limit(1)
+    ).scalars().first()
+
+    next_due = db.execute(
+        select(PremiumSchedule)
+        .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False)  # noqa: E712
+        .order_by(asc(PremiumSchedule.due_date))
+        .limit(1)
+    ).scalars().first()
+
+    next_due_date = next_due.due_date if next_due else policy.next_premium_due_date
+
+    msg_parts = [f"Policy {policy.policy_number} status: {policy.status}."]
+    if next_due_date:
+        msg_parts.append(f"Next premium due date: {next_due_date.isoformat()}.")
+    if policy.premium_amount is not None:
+        msg_parts.append(f"Premium amount: ₹{float(policy.premium_amount):,.2f}.")
+    if policy.maturity_date:
+        msg_parts.append(f"Maturity date: {policy.maturity_date.isoformat()}.")
+    if policy.maturity_amount_expected is not None:
+        msg_parts.append(f"Expected maturity amount: ₹{float(policy.maturity_amount_expected):,.2f}.")
+    if last_payment:
+        msg_parts.append(
+            f"Last payment: {last_payment.paid_on.isoformat()} "
+            f"({last_payment.status}, ₹{float(last_payment.amount):,.2f})."
+        )
+
     audit(
-      db,
-      channel=payload.channel,
-      request_id=payload.request_id,
-      action="POLICY_LOOKUP",
-      policy_number=pn,
-      customer_phone=payload.customer_phone_e164,
-      success=False,
-      reason="INVALID_POLICY_FORMAT",
-    )
-    raise HTTPException(status_code=400, detail="Invalid policy number format.")
-
-  policy = db.execute(select(Policy).where(Policy.policy_number == pn)).scalars().first()
-
-  if not policy:
-    audit(
-      db,
-      channel=payload.channel,
-      request_id=payload.request_id,
-      action="POLICY_LOOKUP",
-      policy_number=pn,
-      customer_phone=payload.customer_phone_e164,
-      success=False,
-      reason="NOT_FOUND",
-    )
-    return PolicyLookupResponse(found=False, message="Policy not found. Please verify the policy number.")
-
-  if payload.customer_phone_e164 and policy.customer and policy.customer.phone_e164:
-    if payload.customer_phone_e164.strip() != policy.customer.phone_e164.strip():
-      audit(
         db,
         channel=payload.channel,
         request_id=payload.request_id,
         action="POLICY_LOOKUP",
         policy_number=pn,
         customer_phone=payload.customer_phone_e164,
-        success=False,
-        reason="PHONE_MISMATCH",
-      )
-      raise HTTPException(status_code=403, detail="Verification failed (phone mismatch).")
-
-  last_payment = db.execute(
-    select(Payment)
-    .where(Payment.policy_id == policy.id)
-    .order_by(desc(Payment.paid_on), desc(Payment.created_at))
-    .limit(1)
-  ).scalars().first()
-
-  next_due = db.execute(
-    select(PremiumSchedule)
-    .where(PremiumSchedule.policy_id == policy.id, PremiumSchedule.is_paid == False) # noqa: E712
-    .order_by(asc(PremiumSchedule.due_date))
-    .limit(1)
-  ).scalars().first()
-
-  next_due_date = next_due.due_date if next_due else policy.next_premium_due_date
-
-  msg_parts = [f"Policy {policy.policy_number} status: {policy.status}."]
-  if next_due_date:
-    msg_parts.append(f"Next premium due date: {next_due_date.isoformat()}.")
-  if policy.premium_amount is not None:
-    msg_parts.append(f"Premium amount: ₹{float(policy.premium_amount):,.2f}.")
-  if policy.maturity_date:
-    msg_parts.append(f"Maturity date: {policy.maturity_date.isoformat()}.")
-  if policy.maturity_amount_expected is not None:
-    msg_parts.append(f"Expected maturity amount: ₹{float(policy.maturity_amount_expected):,.2f}.")
-  if last_payment:
-    msg_parts.append(
-      f"Last payment: {last_payment.paid_on.isoformat()} "
-      f"({last_payment.status}, ₹{float(last_payment.amount):,.2f})."
+        success=True,
+        reason=None,
     )
 
-  audit(
-    db,
-    channel=payload.channel,
-    request_id=payload.request_id,
-    action="POLICY_LOOKUP",
-    policy_number=pn,
-    customer_phone=payload.customer_phone_e164,
-    success=True,
-    reason=None,
-  )
-
-  return PolicyLookupResponse(
-    found=True,
-    policy_number=policy.policy_number,
-    carrier=policy.carrier,
-    status=policy.status,
-    plan_name=policy.plan_name,
-    premium_amount=money(policy.premium_amount),
-    next_premium_due_date=next_due_date,
-    grace_period_days=int(policy.grace_period_days) if str(policy.grace_period_days).isdigit() else None,
-    maturity_date=policy.maturity_date,
-    maturity_amount_expected=money(policy.maturity_amount_expected),
-    sum_assured=money(policy.sum_assured),
-    last_payment_date=last_payment.paid_on if last_payment else None,
-    last_payment_amount=money(last_payment.amount) if last_payment else None,
-    last_payment_status=last_payment.status if last_payment else None,
-    message=" ".join(msg_parts),
-  )
+    return PolicyLookupResponse(
+        found=True,
+        policy_number=policy.policy_number,
+        carrier=policy.carrier,
+        status=policy.status,
+        plan_name=policy.plan_name,
+        premium_amount=money(policy.premium_amount),
+        next_premium_due_date=next_due_date,
+        grace_period_days=int(policy.grace_period_days) if str(policy.grace_period_days).isdigit() else None,
+        maturity_date=policy.maturity_date,
+        maturity_amount_expected=money(policy.maturity_amount_expected),
+        sum_assured=money(policy.sum_assured),
+        last_payment_date=last_payment.paid_on if last_payment else None,
+        last_payment_amount=money(last_payment.amount) if last_payment else None,
+        last_payment_status=last_payment.status if last_payment else None,
+        message=" ".join(msg_parts),
+    )
 
 
 # =========================================================
@@ -1099,267 +813,52 @@ def policy_lookup(payload: PolicyLookupRequest, db: Session = Depends(get_db)):
 
 @app.get("/admin/policies")
 def admin_list_policies(q: Optional[str] = None, limit: int = 50, db: Session = Depends(get_db)):
-  limit = min(max(limit, 1), 200)
-  stmt = select(Policy).order_by(desc(Policy.created_at)).limit(limit)
-  if q:
-    qq = f"%{q.strip()}%"
-    stmt = (
-      select(Policy)
-      .where(Policy.policy_number.like(qq))
-      .order_by(desc(Policy.created_at))
-      .limit(limit)
-    )
-
-  items = db.execute(stmt).scalars().all()
-  data = []
-  for p in items:
-    data.append({
-      "policy_number": p.policy_number,
-      "carrier": p.carrier,
-      "status": p.status,
-      "plan_name": p.plan_name,
-      "premium_amount": money(p.premium_amount),
-      "next_premium_due_date": p.next_premium_due_date.isoformat() if p.next_premium_due_date else None,
-      "maturity_date": p.maturity_date.isoformat() if p.maturity_date else None,
-      "created_at": p.created_at.isoformat() if p.created_at else None,
-    })
-  return {"items": data}
-
-
-
-
-@app.post("/admin/policies/upload")
-async def admin_policies_upload(file: UploadFile = File(...), dry_run: bool = False, db: Session = Depends(get_db)):
-  """Upload policies/customers from an Excel .xlsx file.
-
-  This only INSERTS new records by default (no destructive changes). If a policy_number already exists, that row is skipped.
-
-  Supported headers (case-insensitive):
-   Customer: full_name, phone_e164, email, dob, pan_last4
-   Policy: carrier, policy_number, plan_name, plan_code, status, start_date, end_date, maturity_date,
-       sum_assured, maturity_amount_expected, premium_amount, premium_frequency, next_premium_due_date,
-       grace_period_days, nominee_name, nominee_relation
-  """
-  if openpyxl is None:
-    raise HTTPException(status_code=400, detail="Excel upload requires openpyxl. Add it to requirements.txt and redeploy.")
-  if not (file.filename or "").lower().endswith('.xlsx'):
-    raise HTTPException(status_code=400, detail="Please upload a .xlsx Excel file.")
-
-  content = await file.read()
-  try:
-    wb = openpyxl.load_workbook(filename=BytesIO(content))
-  except Exception as e:
-    raise HTTPException(status_code=400, detail=f"Invalid Excel file: {str(e)[:200]}")
-  ws = wb.active
-
-  # Header map
-  headers = {}
-  first = next(ws.iter_rows(min_row=1, max_row=1))
-  for j, cell in enumerate(first, start=1):
-    key = (str(cell.value).strip().lower() if cell.value is not None else "")
-    if key:
-      headers[key] = j
-
-  def col(name: str):
-    return headers.get(name.lower())
-
-  required = ['policy_number', 'full_name', 'start_date']
-  missing = [r for r in required if col(r) is None]
-  if missing:
-    raise HTTPException(status_code=400, detail=f"Missing required columns: {', '.join(missing)}")
-
-  def getv(row, name, default=None):
-    j = col(name)
-    if not j:
-      return default
-    v = row[j-1].value
-    return v if v is not None else default
-
-  def parse_date(v):
-    if v is None or v == "":
-      return None
-    if isinstance(v, datetime):
-      return v.date()
-    if isinstance(v, date):
-      return v
-    s = str(v).strip()
-    if not s:
-      return None
-    m1 = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', s)
-    m2 = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', s)
-    if m1:
-      return date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
-    if m2:
-      return date(int(m2.group(3)), int(m2.group(2)), int(m2.group(1)))
-    return None
-
-  def parse_num(v):
-    if v is None or v == "":
-      return None
-    try:
-      return float(v)
-    except Exception:
-      try:
-        return float(str(v).replace(',', '').strip())
-      except Exception:
-        return None
-
-  created_customers = created_policies = skipped = 0
-  details = []
-
-  for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-    try:
-      policy_number = str(getv(row, 'policy_number', '')).strip()
-      full_name = str(getv(row, 'full_name', '')).strip()
-      if not policy_number or not full_name:
-        skipped += 1
-        details.append({'row': i, 'status': 'SKIP', 'reason': 'missing policy_number/full_name'})
-        continue
-
-      # Skip if policy exists
-      existing = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
-      if existing:
-        skipped += 1
-        details.append({'row': i, 'status': 'SKIP', 'reason': 'policy exists', 'policy_number': policy_number})
-        continue
-
-      phone = getv(row, 'phone_e164')
-      phone = str(phone).strip() if phone is not None else None
-      email = getv(row, 'email')
-      email = str(email).strip() if email is not None else None
-      dob = parse_date(getv(row, 'dob'))
-      pan_last4 = getv(row, 'pan_last4')
-      pan_last4 = str(pan_last4).strip() if pan_last4 is not None else None
-
-      # Find or create customer
-      cust = None
-      if phone:
-        phone_norm = phone if phone.startswith('+') else f'+{phone}'
-        cust = db.execute(select(Customer).where(Customer.phone_e164 == phone_norm)).scalars().first()
-      else:
-        phone_norm = None
-      if cust is None and email:
-        cust = db.execute(select(Customer).where(Customer.email == email)).scalars().first()
-
-      if cust is None:
-        cust = Customer(
-          full_name=full_name,
-          phone_e164=phone_norm,
-          email=email,
-          dob=dob,
-          pan_last4=pan_last4,
-          created_at=now_utc(),
-          updated_at=now_utc(),
+    limit = min(max(limit, 1), 200)
+    stmt = select(Policy).order_by(desc(Policy.created_at)).limit(limit)
+    if q:
+        qq = f"%{q.strip()}%"
+        stmt = (
+            select(Policy)
+            .where(Policy.policy_number.like(qq))
+            .order_by(desc(Policy.created_at))
+            .limit(limit)
         )
-        if not dry_run:
-          db.add(cust)
-          db.commit()
-          db.refresh(cust)
-        created_customers += 1
-      else:
-        # Non-destructive: fill missing fields only
-        changed = False
-        if full_name and not cust.full_name:
-          cust.full_name = full_name; changed = True
-        if phone_norm and not cust.phone_e164:
-          cust.phone_e164 = phone_norm; changed = True
-        if email and not cust.email:
-          cust.email = email; changed = True
-        if dob and not cust.dob:
-          cust.dob = dob; changed = True
-        if pan_last4 and not cust.pan_last4:
-          cust.pan_last4 = pan_last4; changed = True
-        if changed and not dry_run:
-          cust.updated_at = now_utc()
-          db.add(cust)
-          db.commit()
 
-      # Policy fields
-      carrier = str(getv(row, 'carrier', 'LIC') or 'LIC').strip() or 'LIC'
-      plan_name = getv(row, 'plan_name')
-      plan_code = getv(row, 'plan_code')
-      status = str(getv(row, 'status', 'ACTIVE') or 'ACTIVE').strip() or 'ACTIVE'
-      start_date = parse_date(getv(row, 'start_date'))
-      if not start_date:
-        skipped += 1
-        details.append({'row': i, 'status': 'SKIP', 'reason': 'missing/invalid start_date', 'policy_number': policy_number})
-        continue
-      end_date = parse_date(getv(row, 'end_date'))
-      maturity_date = parse_date(getv(row, 'maturity_date'))
-      sum_assured = parse_num(getv(row, 'sum_assured'))
-      maturity_amt = parse_num(getv(row, 'maturity_amount_expected'))
-      premium_amt = parse_num(getv(row, 'premium_amount'))
-      premium_freq = str(getv(row, 'premium_frequency', 'YEARLY') or 'YEARLY').strip() or 'YEARLY'
-      next_due = parse_date(getv(row, 'next_premium_due_date'))
-      grace = getv(row, 'grace_period_days')
-      grace = str(grace).strip() if grace is not None else None
-      nominee_name = getv(row, 'nominee_name')
-      nominee_relation = getv(row, 'nominee_relation')
+    items = db.execute(stmt).scalars().all()
+    data = []
+    for p in items:
+        data.append({
+            "policy_number": p.policy_number,
+            "carrier": p.carrier,
+            "status": p.status,
+            "plan_name": p.plan_name,
+            "premium_amount": money(p.premium_amount),
+            "next_premium_due_date": p.next_premium_due_date.isoformat() if p.next_premium_due_date else None,
+            "maturity_date": p.maturity_date.isoformat() if p.maturity_date else None,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        })
+    return {"items": data}
 
-      pol = Policy(
-        carrier=carrier,
-        policy_number=policy_number,
-        customer_id=cust.id if hasattr(cust, 'id') else None,
-        plan_name=str(plan_name).strip() if plan_name is not None else None,
-        plan_code=str(plan_code).strip() if plan_code is not None else None,
-        status=status,
-        start_date=start_date,
-        end_date=end_date,
-        maturity_date=maturity_date,
-        sum_assured=sum_assured,
-        maturity_amount_expected=maturity_amt,
-        premium_amount=premium_amt,
-        premium_frequency=premium_freq,
-        next_premium_due_date=next_due,
-        grace_period_days=grace,
-        nominee_name=str(nominee_name).strip() if nominee_name is not None else None,
-        nominee_relation=str(nominee_relation).strip() if nominee_relation is not None else None,
-        created_at=now_utc(),
-        updated_at=now_utc(),
-      )
 
-      if not dry_run:
-        db.add(pol)
-        db.commit()
-
-      created_policies += 1
-      details.append({'row': i, 'status': 'OK', 'policy_number': policy_number})
-    except Exception as e:
-      skipped += 1
-      details.append({'row': i, 'status': 'ERROR', 'reason': str(e)[:200]})
-      try:
-        if not dry_run:
-          db.commit()
-      except Exception:
-        pass
-
-  return {
-    'ok': True,
-    'dry_run': bool(dry_run),
-    'created_customers': created_customers,
-    'created_policies': created_policies,
-    'skipped': skipped,
-    'details': details[:200],
-  }
 @app.get("/admin/audit")
 def admin_audit(limit: int = 100, db: Session = Depends(get_db)):
-  limit = min(max(limit, 1), 300)
-  items = db.execute(
-    select(AuditLog).order_by(desc(AuditLog.created_at)).limit(limit)
-  ).scalars().all()
+    limit = min(max(limit, 1), 300)
+    items = db.execute(
+        select(AuditLog).order_by(desc(AuditLog.created_at)).limit(limit)
+    ).scalars().all()
 
-  data = []
-  for a in items:
-    data.append({
-      "created_at": a.created_at.isoformat() if a.created_at else None,
-      "channel": a.channel,
-      "action": a.action,
-      "policy_number": a.policy_number,
-      "success": a.success,
-      "reason": a.reason,
-      "request_id": a.request_id,
-    })
-  return {"items": data}
+    data = []
+    for a in items:
+        data.append({
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "channel": a.channel,
+            "action": a.action,
+            "policy_number": a.policy_number,
+            "success": a.success,
+            "reason": a.reason,
+            "request_id": a.request_id,
+        })
+    return {"items": data}
 
 
 # =========================================================
@@ -1368,359 +867,182 @@ def admin_audit(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/admin/team")
 def admin_team(db: Session = Depends(get_db)):
-  seed_team_if_empty(db)
-  users = db.execute(
-    select(TeamUser).where(TeamUser.is_active == True).order_by(asc(TeamUser.role), asc(TeamUser.full_name)) # noqa: E712
-  ).scalars().all()
-  return {
-    "items": [{"id": u.id, "role": u.role, "full_name": u.full_name} for u in users]
-  }
+    seed_team_if_empty(db)
+    users = db.execute(
+        select(TeamUser).where(TeamUser.is_active == True).order_by(asc(TeamUser.role), asc(TeamUser.full_name))  # noqa: E712
+    ).scalars().all()
+    return {
+        "items": [{"id": u.id, "role": u.role, "full_name": u.full_name} for u in users]
+    }
 
 
 @app.get("/admin/inbox/conversations")
 def admin_inbox_conversations(
-  status: Optional[str] = None,
-  assigned_to: Optional[str] = None,
-  q: Optional[str] = None,
-  limit: int = 80,
-  db: Session = Depends(get_db),
+    status: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 80,
+    db: Session = Depends(get_db),
 ):
-  limit = min(max(limit, 1), 200)
+    limit = min(max(limit, 1), 200)
 
-  stmt = select(InboxConversation).order_by(desc(InboxConversation.last_message_at)).limit(limit)
+    stmt = select(InboxConversation).order_by(desc(InboxConversation.last_message_at)).limit(limit)
 
-  if status:
-    stmt = stmt.where(InboxConversation.status == status.upper())
-  if assigned_to:
-    if assigned_to.lower() == "unassigned":
-      stmt = stmt.where(InboxConversation.assigned_to_user_id.is_(None))
-    else:
-      stmt = stmt.where(InboxConversation.assigned_to_user_id == assigned_to)
-  if q:
-    qq = f"%{q.strip()}%"
-    stmt = stmt.where(
-      (InboxConversation.customer_phone.like(qq)) |
-      (InboxConversation.customer_name.like(qq)) |
-      (InboxConversation.policy_number.like(qq))
-    )
+    if status:
+        stmt = stmt.where(InboxConversation.status == status.upper())
+    if assigned_to:
+        if assigned_to.lower() == "unassigned":
+            stmt = stmt.where(InboxConversation.assigned_to_user_id.is_(None))
+        else:
+            stmt = stmt.where(InboxConversation.assigned_to_user_id == assigned_to)
+    if q:
+        qq = f"%{q.strip()}%"
+        stmt = stmt.where(
+            (InboxConversation.customer_phone.like(qq)) |
+            (InboxConversation.customer_name.like(qq)) |
+            (InboxConversation.policy_number.like(qq))
+        )
 
-  items = db.execute(stmt).scalars().all()
-  users = db.execute(select(TeamUser)).scalars().all()
-  user_map = {u.id: u.full_name for u in users}
+    items = db.execute(stmt).scalars().all()
+    users = db.execute(select(TeamUser)).scalars().all()
+    user_map = {u.id: u.full_name for u in users}
 
-  return {
-    "items": [{
-      "id": c.id,
-      "channel": c.channel,
-      "customer_phone": c.customer_phone,
-      "customer_name": c.customer_name,
-      "policy_number": c.policy_number,
-      "status": c.status,
-      "priority": c.priority,
-      "assigned_to_user_id": c.assigned_to_user_id,
-      "assigned_to_name": user_map.get(c.assigned_to_user_id),
-      "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
-    } for c in items]
-  }
+    return {
+        "items": [{
+            "id": c.id,
+            "channel": c.channel,
+            "customer_phone": c.customer_phone,
+            "customer_name": c.customer_name,
+            "policy_number": c.policy_number,
+            "status": c.status,
+            "priority": c.priority,
+            "assigned_to_user_id": c.assigned_to_user_id,
+            "assigned_to_name": user_map.get(c.assigned_to_user_id),
+            "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+        } for c in items]
+    }
 
 
 @app.get("/admin/inbox/conversations/{conversation_id}")
 def admin_inbox_conversation_detail(conversation_id: str, db: Session = Depends(get_db)):
-  conv = db.execute(select(InboxConversation).where(InboxConversation.id == conversation_id)).scalars().first()
-  if not conv:
-    raise HTTPException(status_code=404, detail="Conversation not found")
+    conv = db.execute(select(InboxConversation).where(InboxConversation.id == conversation_id)).scalars().first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-  msgs = db.execute(
-    select(InboxMessage).where(InboxMessage.conversation_id == conversation_id).order_by(asc(InboxMessage.created_at))
-  ).scalars().all()
+    msgs = db.execute(
+        select(InboxMessage).where(InboxMessage.conversation_id == conversation_id).order_by(asc(InboxMessage.created_at))
+    ).scalars().all()
 
-  users = db.execute(select(TeamUser)).scalars().all()
-  user_map = {u.id: {"name": u.full_name, "role": u.role} for u in users}
+    users = db.execute(select(TeamUser)).scalars().all()
+    user_map = {u.id: {"name": u.full_name, "role": u.role} for u in users}
 
-  return {
-    "conversation": {
-      "id": conv.id,
-      "channel": conv.channel,
-      "customer_phone": conv.customer_phone,
-      "customer_name": conv.customer_name,
-      "policy_number": conv.policy_number,
-      "status": conv.status,
-      "priority": conv.priority,
-      "assigned_to_user_id": conv.assigned_to_user_id,
-      "assigned_to_name": user_map.get(conv.assigned_to_user_id, {}).get("name"),
-      "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
-    },
-    "messages": [{
-      "id": m.id,
-      "direction": m.direction,
-      "body": m.body,
-      "actor_user_id": m.actor_user_id,
-      "actor_name": user_map.get(m.actor_user_id, {}).get("name") if m.actor_user_id else None,
-      "created_at": m.created_at.isoformat() if m.created_at else None,
-    } for m in msgs]
-  }
+    return {
+        "conversation": {
+            "id": conv.id,
+            "channel": conv.channel,
+            "customer_phone": conv.customer_phone,
+            "customer_name": conv.customer_name,
+            "policy_number": conv.policy_number,
+            "status": conv.status,
+            "priority": conv.priority,
+            "assigned_to_user_id": conv.assigned_to_user_id,
+            "assigned_to_name": user_map.get(conv.assigned_to_user_id, {}).get("name"),
+            "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+        },
+        "messages": [{
+            "id": m.id,
+            "direction": m.direction,
+            "body": m.body,
+            "actor_user_id": m.actor_user_id,
+            "actor_name": user_map.get(m.actor_user_id, {}).get("name") if m.actor_user_id else None,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        } for m in msgs]
+    }
 
 
 @app.post("/admin/inbox/conversations/{conversation_id}/assign")
 def admin_inbox_assign(conversation_id: str, payload: InboxAssignRequest, db: Session = Depends(get_db)):
-  conv = db.execute(select(InboxConversation).where(InboxConversation.id == conversation_id)).scalars().first()
-  if not conv:
-    raise HTTPException(status_code=404, detail="Conversation not found")
+    conv = db.execute(select(InboxConversation).where(InboxConversation.id == conversation_id)).scalars().first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-  if payload.assigned_to_user_id is not None:
-    if payload.assigned_to_user_id != "":
-      user = db.execute(select(TeamUser).where(TeamUser.id == payload.assigned_to_user_id)).scalars().first()
-      if not user:
-        raise HTTPException(status_code=400, detail="Invalid assigned_to_user_id")
-      conv.assigned_to_user_id = user.id
-    else:
-      conv.assigned_to_user_id = None
+    if payload.assigned_to_user_id is not None:
+        if payload.assigned_to_user_id != "":
+            user = db.execute(select(TeamUser).where(TeamUser.id == payload.assigned_to_user_id)).scalars().first()
+            if not user:
+                raise HTTPException(status_code=400, detail="Invalid assigned_to_user_id")
+            conv.assigned_to_user_id = user.id
+        else:
+            conv.assigned_to_user_id = None
 
-  if payload.status:
-    st = payload.status.upper()
-    if st not in ("OPEN", "PENDING", "CLOSED"):
-      raise HTTPException(status_code=400, detail="Invalid status")
-    conv.status = st
+    if payload.status:
+        st = payload.status.upper()
+        if st not in ("OPEN", "PENDING", "CLOSED"):
+            raise HTTPException(status_code=400, detail="Invalid status")
+        conv.status = st
 
-  if payload.priority:
-    pr = payload.priority.upper()
-    if pr not in ("LOW", "NORMAL", "HIGH"):
-      raise HTTPException(status_code=400, detail="Invalid priority")
-    conv.priority = pr
+    if payload.priority:
+        pr = payload.priority.upper()
+        if pr not in ("LOW", "NORMAL", "HIGH"):
+            raise HTTPException(status_code=400, detail="Invalid priority")
+        conv.priority = pr
 
-  conv.updated_at = now_utc()
-  db.commit()
-  return {"ok": True}
+    conv.updated_at = now_utc()
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/admin/inbox/conversations/{conversation_id}/send")
 def admin_inbox_send(conversation_id: str, payload: InboxSendRequest, db: Session = Depends(get_db)):
-  """
-  If direction == OUT: deliver message to WhatsApp and store it in DB thread.
-  If direction == NOTE: store internal note only.
-  """
-  conv = db.execute(select(InboxConversation).where(InboxConversation.id == conversation_id)).scalars().first()
-  if not conv:
-    raise HTTPException(status_code=404, detail="Conversation not found")
+    """
+    If direction == OUT: deliver message to WhatsApp and store it in DB thread.
+    If direction == NOTE: store internal note only.
+    """
+    conv = db.execute(select(InboxConversation).where(InboxConversation.id == conversation_id)).scalars().first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-  direction = payload.direction.upper().strip()
-  if direction not in ("OUT", "NOTE"):
-    raise HTTPException(status_code=400, detail="direction must be OUT or NOTE")
+    direction = payload.direction.upper().strip()
+    if direction not in ("OUT", "NOTE"):
+        raise HTTPException(status_code=400, detail="direction must be OUT or NOTE")
 
-  actor_id = payload.actor_user_id
-  if actor_id:
-    user = db.execute(
-      select(TeamUser).where(TeamUser.id == actor_id, TeamUser.is_active == True) # noqa: E712
-    ).scalars().first()
-    if not user:
-      raise HTTPException(status_code=400, detail="Invalid actor_user_id")
+    actor_id = payload.actor_user_id
+    if actor_id:
+        user = db.execute(
+            select(TeamUser).where(TeamUser.id == actor_id, TeamUser.is_active == True)  # noqa: E712
+        ).scalars().first()
+        if not user:
+            raise HTTPException(status_code=400, detail="Invalid actor_user_id")
 
-  text = payload.body.strip()
-  if not text:
-    raise HTTPException(status_code=400, detail="Message body cannot be empty")
+    text = payload.body.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message body cannot be empty")
 
-  wa_result = None
-  if direction == "OUT":
-    # deliver to WhatsApp
-    try:
-      wa_result = send_whatsapp_text(conv.customer_phone, text)
-    except Exception as e:
-      # don't store message if delivery failed
-      raise HTTPException(status_code=502, detail=f"WhatsApp delivery failed: {str(e)}")
+    wa_result = None
+    if direction == "OUT":
+        # deliver to WhatsApp
+        try:
+            wa_result = send_whatsapp_text(conv.customer_phone, text)
+        except Exception as e:
+            # don't store message if delivery failed
+            raise HTTPException(status_code=502, detail=f"WhatsApp delivery failed: {str(e)}")
 
-  # Store message in thread (history)
-  db.add(
-    InboxMessage(
-      conversation_id=conversation_id,
-      direction=direction,
-      body=text,
-      actor_user_id=actor_id,
-      created_at=now_utc(),
+    # Store message in thread (history)
+    db.add(
+        InboxMessage(
+            conversation_id=conversation_id,
+            direction=direction,
+            body=text,
+            actor_user_id=actor_id,
+            created_at=now_utc(),
+        )
     )
-  )
 
-  conv.last_message_at = now_utc()
-  conv.updated_at = now_utc()
-  db.commit()
+    conv.last_message_at = now_utc()
+    conv.updated_at = now_utc()
+    db.commit()
 
-  return {"ok": True, "whatsapp_result": wa_result}
-
-
-
-# =========================================================
-# PREMIUM REMINDERS (DB scan + Bulk upload)
-# =========================================================
-
-class PremiumReminderRunResponse(BaseModel):
-  ok: bool
-  scanned: int = 0
-  sent: int = 0
-  skipped: int = 0
-  errors: int = 0
-  details: list[dict] = []
-
-
-@app.post("/admin/reminders/run", response_model=PremiumReminderRunResponse)
-def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: Session = Depends(get_db)):
-  days_ahead = max(0, min(int(days_ahead), 60))
-  today = now_utc().date()
-  end = today + timedelta(days=days_ahead)
-
-  rows = db.execute(
-    select(PremiumSchedule, Policy, Customer)
-    .join(Policy, PremiumSchedule.policy_id == Policy.id)
-    .join(Customer, Policy.customer_id == Customer.id)
-    .where(
-      PremiumSchedule.is_paid == False,
-      PremiumSchedule.due_date >= today,
-      PremiumSchedule.due_date <= end,
-    )
-    .order_by(asc(PremiumSchedule.due_date))
-  ).all()
-
-  scanned = len(rows)
-  sent = skipped = errors = 0
-  details: list[dict] = []
-
-  for ps, pol, cust in rows:
-    try:
-      phone = (cust.phone_e164 or "").strip()
-      if not phone:
-        skipped += 1
-        details.append({"policy_number": pol.policy_number, "status": "SKIP", "reason": "NO_PHONE"})
-        continue
-
-      customer_phone = phone if phone.startswith("+") else f"+{phone}"
-
-      if _already_reminded_today(db, policy_number=pol.policy_number, due_date=ps.due_date, customer_phone=customer_phone):
-        skipped += 1
-        details.append({"policy_number": pol.policy_number, "status": "SKIP", "reason": "ALREADY_SENT_TODAY"})
-        continue
-
-      msg = _premium_reminder_message(
-        policy_number=pol.policy_number,
-        due_date=ps.due_date,
-        amount=float(ps.amount) if ps.amount is not None else (float(pol.premium_amount) if pol.premium_amount is not None else None),
-      )
-
-      if not dry_run:
-        send_whatsapp_text(customer_phone, msg)
-
-      conv = _ensure_inbox_conversation(db, customer_phone=customer_phone, customer_name=cust.full_name, policy_number=pol.policy_number)
-      db.add(InboxMessage(conversation_id=conv.id, direction="OUT", body=msg, actor_user_id=None, created_at=now_utc()))
-      conv.last_message_at = now_utc()
-      conv.updated_at = now_utc()
-      db.commit()
-
-      audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=pol.policy_number, customer_phone=customer_phone, success=True, reason=f"DUE:{ps.due_date.isoformat() if ps.due_date else 'NA'}")
-
-      sent += 1
-      details.append({"policy_number": pol.policy_number, "status": "SENT", "phone": customer_phone, "due_date": ps.due_date.isoformat()})
-    except Exception as e:
-      errors += 1
-      details.append({"policy_number": getattr(pol, "policy_number", None), "status": "ERROR", "reason": str(e)[:200]})
-      try:
-        audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=getattr(pol, "policy_number", None), customer_phone=(cust.phone_e164 if cust else None), success=False, reason=str(e)[:250])
-      except Exception:
-        pass
-      try:
-        db.commit()
-      except Exception:
-        pass
-
-  return PremiumReminderRunResponse(ok=True, scanned=scanned, sent=sent, skipped=skipped, errors=errors, details=details)
-
-
-@app.post("/admin/broadcast/premium")
-async def admin_broadcast_premium_excel(file: UploadFile = File(...), dry_run: bool = False, db: Session = Depends(get_db)):
-  if openpyxl is None:
-    raise HTTPException(status_code=400, detail="Excel upload requires openpyxl. Add it to requirements.txt and redeploy.")
-  if not file.filename.lower().endswith(".xlsx"):
-    raise HTTPException(status_code=400, detail="Please upload a .xlsx Excel file.")
-
-  content = await file.read()
-  wb = openpyxl.load_workbook(filename=BytesIO(content))
-  ws = wb.active
-
-  headers = {}
-  first = next(ws.iter_rows(min_row=1, max_row=1))
-  for j, cell in enumerate(first, start=1):
-    key = (str(cell.value).strip().lower() if cell.value is not None else "")
-    headers[key] = j
-
-  required = ["phone", "policy_number", "premium_due_date", "premium_amount"]
-  for r in required:
-    if r not in headers:
-      raise HTTPException(status_code=400, detail=f"Missing column '{r}' in Excel header row. Required: {', '.join(required)}")
-
-  sent = skipped = errors = 0
-  details = []
-
-  for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-    try:
-      phone = str(row[headers["phone"] - 1].value or "").strip()
-      policy_number = str(row[headers["policy_number"] - 1].value or "").strip()
-      due_raw = row[headers["premium_due_date"] - 1].value
-      amt_raw = row[headers["premium_amount"] - 1].value
-
-      if not phone or not policy_number:
-        skipped += 1
-        details.append({"row": i, "status": "SKIP", "reason": "MISSING_PHONE_OR_POLICY"})
-        continue
-
-      customer_phone = phone if phone.startswith("+") else f"+{phone}"
-
-      due_date = None
-      if isinstance(due_raw, datetime):
-        due_date = due_raw.date()
-      elif isinstance(due_raw, date):
-        due_date = due_raw
-      else:
-        s = str(due_raw or "").strip()
-        if s:
-          m1 = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
-          m2 = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
-          if m1:
-            due_date = date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
-          elif m2:
-            due_date = date(int(m2.group(3)), int(m2.group(2)), int(m2.group(1)))
-
-      amount = None
-      try:
-        if amt_raw is not None and str(amt_raw).strip() != "":
-          amount = float(amt_raw)
-      except Exception:
-        amount = None
-
-      msg = _premium_reminder_message(policy_number=policy_number, due_date=due_date, amount=amount)
-
-      if not dry_run:
-        send_whatsapp_text(customer_phone, msg)
-
-      conv = _ensure_inbox_conversation(db, customer_phone=customer_phone, customer_name=None, policy_number=policy_number)
-      db.add(InboxMessage(conversation_id=conv.id, direction="OUT", body=msg, actor_user_id=None, created_at=now_utc()))
-      conv.last_message_at = now_utc()
-      conv.updated_at = now_utc()
-      db.commit()
-
-      audit(db, channel="WHATSAPP", request_id=None, action="BULK_PREMIUM_REMINDER", policy_number=policy_number, customer_phone=customer_phone, success=True, reason=f"ROW:{i}")
-
-      sent += 1
-      details.append({"row": i, "status": "SENT", "phone": customer_phone, "policy_number": policy_number})
-    except Exception as e:
-      errors += 1
-      details.append({"row": i, "status": "ERROR", "reason": str(e)[:200]})
-      try:
-        audit(db, channel="WHATSAPP", request_id=None, action="BULK_PREMIUM_REMINDER", policy_number=None, customer_phone=None, success=False, reason=str(e)[:250])
-      except Exception:
-        pass
-      try:
-        db.commit()
-      except Exception:
-        pass
-
-  return {"ok": True, "sent": sent, "skipped": skipped, "errors": errors, "details": details}
-
+    return {"ok": True, "whatsapp_result": wa_result}
 
 
 # =========================================================
@@ -1731,903 +1053,791 @@ DASHBOARD_HTML = r"""
 <!doctype html>
 <html lang="en">
 <head>
- <meta charset="utf-8" />
- <meta name="viewport" content="width=device-width, initial-scale=1" />
- <title>Policy Dashboard + Team Inbox</title>
- <style>
-  :root{
-   --bg: #0b1020;
-   --panel: rgba(255,255,255,.06);
-   --text: rgba(255,255,255,.92);
-   --muted: rgba(255,255,255,.66);
-   --border: rgba(255,255,255,.12);
-   --good: #2fe38a;
-   --warn: #ffcc66;
-   --bad: #ff5c7a;
-   --accent: #7c5cff;
-   --accent2: #22d3ee;
-   --shadow: 0 18px 45px rgba(0,0,0,.40);
-   --radius: 18px;
-   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-   --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-  }
-  *{ box-sizing:border-box; }
-  body{
-   margin:0;
-   font-family:var(--sans);
-   color:var(--text);
-   background:
-    radial-gradient(900px 600px at 20% 10%, rgba(124,92,255,.30), transparent 60%),
-    radial-gradient(800px 500px at 85% 30%, rgba(34,211,238,.25), transparent 55%),
-    radial-gradient(700px 500px at 50% 90%, rgba(47,227,138,.10), transparent 55%),
-    var(--bg);
-   min-height:100vh;
-  }
-  .wrap{ max-width:1180px; margin:0 auto; padding:24px 16px 48px; }
-  .topbar{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
-  .brand{ display:flex; align-items:center; gap:12px; }
-  .logo{
-   width:42px; height:42px; border-radius:14px;
-   background: linear-gradient(135deg, rgba(124,92,255,1), rgba(34,211,238,1));
-   box-shadow: var(--shadow);
-  }
-  h1{ font-size:18px; margin:0; letter-spacing:.2px; }
-  .sub{ color:var(--muted); font-size:12px; margin-top:2px; }
-  .right{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
-  .pill{ font-size:12px; padding:6px 10px; border-radius:999px; border: 1px solid var(--border); background: rgba(255,255,255,.06); color: var(--muted); }
-  .btn{
-   border:0; padding:12px 14px; border-radius: 14px; cursor:pointer; font-weight:700;
-   background: linear-gradient(135deg, rgba(124,92,255,1), rgba(34,211,238,1));
-   color:#071022; box-shadow: 0 14px 35px rgba(124,92,255,.18);
-   transition: transform .08s ease;
-  }
-  .btn:active{ transform: translateY(1px); }
-  .btnGhost{ background: rgba(255,255,255,.06); color: var(--text); border:1px solid var(--border); box-shadow:none; font-weight:700; }
-  .tabs{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
-  .tab{
-   padding:10px 12px; border-radius:999px; border:1px solid var(--border);
-   background: rgba(255,255,255,.05); color: var(--muted);
-   cursor:pointer; font-size:12.5px; user-select:none;
-  }
-  .tab.active{
-   color:#071022;
-   background: linear-gradient(135deg, rgba(124,92,255,1), rgba(34,211,238,1));
-   border-color: transparent;
-   font-weight:800;
-  }
-  .grid{ display:grid; grid-template-columns: 1.05fr .95fr; gap:16px; }
-  @media (max-width: 980px){ .grid{ grid-template-columns: 1fr; } }
-  .card{
-   background: rgba(255,255,255,.06);
-   border: 1px solid var(--border);
-   border-radius: var(--radius);
-   box-shadow: var(--shadow);
-   overflow:hidden;
-  }
-  .cardHeader{
-   padding:14px 16px;
-   border-bottom: 1px solid var(--border);
-   background: linear-gradient(180deg, rgba(255,255,255,.06), transparent);
-   display:flex; align-items:center; justify-content:space-between; gap:12px;
-  }
-  .cardHeader h2{ font-size:14px; margin:0; letter-spacing:.2px; }
-  .cardBody{ padding:16px; }
-  .row{ display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
-  .field{ flex: 1 1 240px; }
-  label{ display:block; font-size:12px; color: var(--muted); margin:0 0 6px; }
-  input, select, textarea{
-   width:100%;
-   padding:12px 12px;
-   border-radius: 14px;
-   border:1px solid var(--border);
-   background: rgba(10,14,28,.55);
-   color: var(--text);
-   outline:none;
-  }
-  textarea{ min-height: 90px; resize: vertical; }
-  .hint{ margin-top:10px; color: var(--muted); font-size:12px; line-height:1.45; }
-  .result{
-   margin-top:14px; padding:14px; border-radius: 16px;
-   border:1px solid var(--border); background: rgba(255,255,255,.05);
-  }
-  .resultTitle{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; }
-  .badge{ font-size:12px; padding:5px 10px; border-radius:999px; border:1px solid var(--border); background: rgba(255,255,255,.06); }
-  .badge.good{ color: var(--good); border-color: rgba(47,227,138,.35); }
-  .badge.bad{ color: var(--bad); border-color: rgba(255,92,122,.35); }
-  .kv{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px; }
-  @media (max-width: 520px){ .kv{ grid-template-columns: 1fr; } }
-  .k{
-   padding:10px 12px; border-radius: 14px;
-   background: rgba(255,255,255,.04);
-   border:1px solid rgba(255,255,255,.08);
-  }
-  .k .t{ color: var(--muted); font-size:12px; margin-bottom:4px; }
-  .k .v{ font-family: var(--mono); font-size:12.5px; }
-  table{
-   width:100%; border-collapse:separate; border-spacing:0;
-   overflow:hidden; border-radius: 16px; border:1px solid var(--border);
-   background: rgba(255,255,255,.04);
-  }
-  th, td{
-   text-align:left; padding:10px 10px;
-   border-bottom:1px solid rgba(255,255,255,.06);
-   font-size:12.5px; vertical-align:top;
-  }
-  th{ color: rgba(255,255,255,.78); font-weight:800; background: rgba(255,255,255,.05); }
-  tr:last-child td{ border-bottom:0; }
-  .mono{ font-family: var(--mono); font-size:12px; color: rgba(255,255,255,.85); }
-  a.link{ color: var(--accent2); text-decoration:none; }
-  .footer{ margin-top:14px; color: var(--muted); font-size:12px; text-align:center; }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Policy Dashboard + Team Inbox</title>
+  <style>
+    :root{
+      --bg: #0b1020;
+      --panel: rgba(255,255,255,.06);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.66);
+      --border: rgba(255,255,255,.12);
+      --good: #2fe38a;
+      --warn: #ffcc66;
+      --bad: #ff5c7a;
+      --accent: #7c5cff;
+      --accent2: #22d3ee;
+      --shadow: 0 18px 45px rgba(0,0,0,.40);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    *{ box-sizing:border-box; }
+    body{
+      margin:0;
+      font-family:var(--sans);
+      color:var(--text);
+      background:
+        radial-gradient(900px 600px at 20% 10%, rgba(124,92,255,.30), transparent 60%),
+        radial-gradient(800px 500px at 85% 30%, rgba(34,211,238,.25), transparent 55%),
+        radial-gradient(700px 500px at 50% 90%, rgba(47,227,138,.10), transparent 55%),
+        var(--bg);
+      min-height:100vh;
+    }
+    .wrap{ max-width:1180px; margin:0 auto; padding:24px 16px 48px; }
+    .topbar{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+    .brand{ display:flex; align-items:center; gap:12px; }
+    .logo{
+      width:42px; height:42px; border-radius:14px;
+      background: linear-gradient(135deg, rgba(124,92,255,1), rgba(34,211,238,1));
+      box-shadow: var(--shadow);
+    }
+    h1{ font-size:18px; margin:0; letter-spacing:.2px; }
+    .sub{ color:var(--muted); font-size:12px; margin-top:2px; }
+    .right{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+    .pill{ font-size:12px; padding:6px 10px; border-radius:999px; border: 1px solid var(--border); background: rgba(255,255,255,.06); color: var(--muted); }
+    .btn{
+      border:0; padding:12px 14px; border-radius: 14px; cursor:pointer; font-weight:700;
+      background: linear-gradient(135deg, rgba(124,92,255,1), rgba(34,211,238,1));
+      color:#071022; box-shadow: 0 14px 35px rgba(124,92,255,.18);
+      transition: transform .08s ease;
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btnGhost{ background: rgba(255,255,255,.06); color: var(--text); border:1px solid var(--border); box-shadow:none; font-weight:700; }
+    .tabs{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+    .tab{
+      padding:10px 12px; border-radius:999px; border:1px solid var(--border);
+      background: rgba(255,255,255,.05); color: var(--muted);
+      cursor:pointer; font-size:12.5px; user-select:none;
+    }
+    .tab.active{
+      color:#071022;
+      background: linear-gradient(135deg, rgba(124,92,255,1), rgba(34,211,238,1));
+      border-color: transparent;
+      font-weight:800;
+    }
+    .grid{ display:grid; grid-template-columns: 1.05fr .95fr; gap:16px; }
+    @media (max-width: 980px){ .grid{ grid-template-columns: 1fr; } }
+    .card{
+      background: rgba(255,255,255,.06);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .cardHeader{
+      padding:14px 16px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(255,255,255,.06), transparent);
+      display:flex; align-items:center; justify-content:space-between; gap:12px;
+    }
+    .cardHeader h2{ font-size:14px; margin:0; letter-spacing:.2px; }
+    .cardBody{ padding:16px; }
+    .row{ display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+    .field{ flex: 1 1 240px; }
+    label{ display:block; font-size:12px; color: var(--muted); margin:0 0 6px; }
+    input, select, textarea{
+      width:100%;
+      padding:12px 12px;
+      border-radius: 14px;
+      border:1px solid var(--border);
+      background: rgba(10,14,28,.55);
+      color: var(--text);
+      outline:none;
+    }
+    textarea{ min-height: 90px; resize: vertical; }
+    .hint{ margin-top:10px; color: var(--muted); font-size:12px; line-height:1.45; }
+    .result{
+      margin-top:14px; padding:14px; border-radius: 16px;
+      border:1px solid var(--border); background: rgba(255,255,255,.05);
+    }
+    .resultTitle{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; }
+    .badge{ font-size:12px; padding:5px 10px; border-radius:999px; border:1px solid var(--border); background: rgba(255,255,255,.06); }
+    .badge.good{ color: var(--good); border-color: rgba(47,227,138,.35); }
+    .badge.bad{ color: var(--bad); border-color: rgba(255,92,122,.35); }
+    .kv{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px; }
+    @media (max-width: 520px){ .kv{ grid-template-columns: 1fr; } }
+    .k{
+      padding:10px 12px; border-radius: 14px;
+      background: rgba(255,255,255,.04);
+      border:1px solid rgba(255,255,255,.08);
+    }
+    .k .t{ color: var(--muted); font-size:12px; margin-bottom:4px; }
+    .k .v{ font-family: var(--mono); font-size:12.5px; }
+    table{
+      width:100%; border-collapse:separate; border-spacing:0;
+      overflow:hidden; border-radius: 16px; border:1px solid var(--border);
+      background: rgba(255,255,255,.04);
+    }
+    th, td{
+      text-align:left; padding:10px 10px;
+      border-bottom:1px solid rgba(255,255,255,.06);
+      font-size:12.5px; vertical-align:top;
+    }
+    th{ color: rgba(255,255,255,.78); font-weight:800; background: rgba(255,255,255,.05); }
+    tr:last-child td{ border-bottom:0; }
+    .mono{ font-family: var(--mono); font-size:12px; color: rgba(255,255,255,.85); }
+    a.link{ color: var(--accent2); text-decoration:none; }
+    .footer{ margin-top:14px; color: var(--muted); font-size:12px; text-align:center; }
 
-  /* Inbox layout */
-  .inboxGrid{ display:grid; grid-template-columns: 360px 1fr; gap:14px; }
-  @media (max-width: 980px){ .inboxGrid{ grid-template-columns: 1fr; } }
-  .convList{
-   max-height: 560px; overflow:auto;
-   border-radius: 16px; border:1px solid var(--border);
-   background: rgba(255,255,255,.04);
-  }
-  .convItem{ padding:12px 12px; border-bottom:1px solid rgba(255,255,255,.06); cursor:pointer; }
-  .convItem:last-child{ border-bottom:0; }
-  .convItem.active{ background: rgba(124,92,255,.16); border-left: 3px solid rgba(34,211,238,.95); }
-  .convTop{ display:flex; justify-content:space-between; gap:10px; }
-  .convName{ font-weight:800; font-size:12.8px; }
-  .convMeta{ color: var(--muted); font-size:11.5px; margin-top:3px; }
-  .chip{
-   font-size:11px; padding:4px 8px; border-radius:999px;
-   border:1px solid rgba(255,255,255,.12);
-   background: rgba(255,255,255,.06);
-   color: rgba(255,255,255,.75);
-  }
-  .chip.good{ color: var(--good); border-color: rgba(47,227,138,.35); }
-  .chip.warn{ color: var(--warn); border-color: rgba(255,204,102,.35); }
-  .chip.bad{ color: var(--bad); border-color: rgba(255,92,122,.35); }
-  .thread{
-   border-radius: 16px; border:1px solid var(--border);
-   background: rgba(255,255,255,.04);
-   max-height: 560px; overflow:auto;
-   padding:12px;
-  }
-  .msg{
-   padding:10px 12px; border-radius: 14px; margin-bottom:10px;
-   border:1px solid rgba(255,255,255,.08);
-   background: rgba(255,255,255,.04);
-  }
-  .msg.in{ border-color: rgba(34,211,238,.25); }
-  .msg.out{ border-color: rgba(47,227,138,.25); }
-  .msg.note{ border-color: rgba(255,204,102,.25); background: rgba(255,204,102,.06); }
-  .msgHead{
-   display:flex; justify-content:space-between; gap:10px;
-   margin-bottom:6px; font-size:11.5px; color: var(--muted);
-  }
-  .compose{ margin-top:12px; display:grid; grid-template-columns: 1fr 180px; gap:10px; }
-  @media (max-width: 700px){ .compose{ grid-template-columns: 1fr; } }
- </style>
+    /* Inbox layout */
+    .inboxGrid{ display:grid; grid-template-columns: 360px 1fr; gap:14px; }
+    @media (max-width: 980px){ .inboxGrid{ grid-template-columns: 1fr; } }
+    .convList{
+      max-height: 560px; overflow:auto;
+      border-radius: 16px; border:1px solid var(--border);
+      background: rgba(255,255,255,.04);
+    }
+    .convItem{ padding:12px 12px; border-bottom:1px solid rgba(255,255,255,.06); cursor:pointer; }
+    .convItem:last-child{ border-bottom:0; }
+    .convItem.active{ background: rgba(124,92,255,.16); border-left: 3px solid rgba(34,211,238,.95); }
+    .convTop{ display:flex; justify-content:space-between; gap:10px; }
+    .convName{ font-weight:800; font-size:12.8px; }
+    .convMeta{ color: var(--muted); font-size:11.5px; margin-top:3px; }
+    .chip{
+      font-size:11px; padding:4px 8px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.06);
+      color: rgba(255,255,255,.75);
+    }
+    .chip.good{ color: var(--good); border-color: rgba(47,227,138,.35); }
+    .chip.warn{ color: var(--warn); border-color: rgba(255,204,102,.35); }
+    .chip.bad{ color: var(--bad); border-color: rgba(255,92,122,.35); }
+    .thread{
+      border-radius: 16px; border:1px solid var(--border);
+      background: rgba(255,255,255,.04);
+      max-height: 560px; overflow:auto;
+      padding:12px;
+    }
+    .msg{
+      padding:10px 12px; border-radius: 14px; margin-bottom:10px;
+      border:1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.04);
+    }
+    .msg.in{ border-color: rgba(34,211,238,.25); }
+    .msg.out{ border-color: rgba(47,227,138,.25); }
+    .msg.note{ border-color: rgba(255,204,102,.25); background: rgba(255,204,102,.06); }
+    .msgHead{
+      display:flex; justify-content:space-between; gap:10px;
+      margin-bottom:6px; font-size:11.5px; color: var(--muted);
+    }
+    .compose{ margin-top:12px; display:grid; grid-template-columns: 1fr 180px; gap:10px; }
+    @media (max-width: 700px){ .compose{ grid-template-columns: 1fr; } }
+  </style>
 </head>
 <body>
- <div class="wrap">
-  <div class="topbar">
-   <div class="brand">
-    <div class="logo"></div>
-    <div>
-     <h1>Policy Dashboard + Team Inbox</h1>
-     <div class="sub">Policy lookup, audit logs, and a shared team inbox for WhatsApp support</div>
-    </div>
-   </div>
-   <div class="right">
-    <span class="pill" id="dbpill">DB: loading…</span>
-    <span class="pill">Webhook: <span class="mono">/webhook</span></span>
-    <button class="btn btnGhost" onclick="refreshAll()">Refresh</button>
-   </div>
-  </div>
-
-  <div class="tabs">
-   <div class="tab active" id="tab-lookup" onclick="showTab('lookup')">Policy Lookup</div>
-   <div class="tab" id="tab-policies" onclick="showTab('policies')">Policies</div>
-   <div class="tab" id="tab-inbox" onclick="showTab('inbox')">Team Inbox</div>
-   <div class="tab" id="tab-audit" onclick="showTab('audit')">Audit Logs</div>
-  </div>
-
-  <div id="panel-lookup">
-   <div class="grid">
-    <div class="card">
-     <div class="cardHeader">
-      <h2>Quick Policy Lookup</h2>
-      <span class="pill">POST /policy/lookup</span>
-     </div>
-     <div class="cardBody">
-      <div class="row">
-       <div class="field">
-        <label>Policy Number</label>
-        <input id="policy_number" placeholder="e.g. 12345678" />
-       </div>
-       <div class="field">
-        <label>Customer Phone (optional verification)</label>
-        <input id="phone" placeholder="+919876543210" />
-       </div>
-       <div class="field" style="flex: 0 0 180px;">
-        <label>Channel</label>
-        <select id="channel">
-         <option>WHATSAPP</option>
-         <option>WEB</option>
-         <option>VOICE</option>
-         <option>AGENT_APP</option>
-        </select>
-       </div>
-       <div style="flex:0 0 auto;">
-        <button class="btn" onclick="doLookup()">Lookup</button>
-       </div>
-      </div>
-
-      <div class="hint">
-       Lookup is DB-backed only (no hallucinations). WhatsApp replies are sent from Inbox tab and delivered via Cloud API.
-      </div>
-
-      <div id="lookup_result" class="result" style="display:none;"></div>
-     </div>
-    </div>
-
-    <div class="card">
-     <div class="cardHeader">
-      <h2>WhatsApp Setup (Meta)</h2>
-      <span class="pill">Delivery enabled</span>
-     </div>
-     <div class="cardBody">
-      <div class="hint">
-       Set Meta webhook URL to <span class="mono">https://YOUR_DOMAIN/webhook</span><br/>
-       Env vars required:
-       <div class="mono" style="margin-top:8px;">
-        WHATSAPP_VERIFY_TOKEN<br/>
-        WHATSAPP_ACCESS_TOKEN<br/>
-        WHATSAPP_PHONE_NUMBER_ID<br/>
-       </div>
-       OUT messages from Inbox are delivered immediately.
-      </div>
-     </div>
-    </div>
-   </div>
-  </div>
-
-  <div id="panel-policies" style="display:none;">
-   <div class="card">
-    <div class="cardHeader">
-     <h2>Policies</h2>
-     <span class="pill">GET /admin/policies</span>
-    </div>
-    <div class="cardBody">
-     <div class="row" style="margin-bottom:10px;">
-      <div class="field">
-       <label>Search by policy number</label>
-       <input id="policy_search" placeholder="type to filter…" oninput="debouncedRefreshPolicies()" />
-      </div>
-     </div>
-     <div style="overflow:auto;">
-      <table>
-       <thead>
-        <tr>
-         <th>Policy</th>
-         <th>Status</th>
-         <th>Next Due</th>
-         <th>Maturity</th>
-        </tr>
-       </thead>
-       <tbody id="policies_tbody">
-        <tr><td colspan="4" class="small">Loading…</td></tr>
-       </tbody>
-      </table>
-     </div>
-     <div class="footer">Tip: click a policy number to auto-fill lookup.</div>
-    </div>
-   </div>
-
-   <div class="card" style="margin-top:12px;">
-    <div class="cardHeader">
-     <h2>Upload Policies (Excel)</h2>
-     <span class="pill">POST /admin/policies/upload</span>
-    </div>
-    <div class="cardBody">
-     <div class="row">
-      <div class="field">
-       <label>Upload .xlsx (required columns: policy_number, full_name, start_date). Optional: phone_e164, email, premium_amount, next_premium_due_date, maturity_date, etc.</label>
-       <input id="pol_xl" type="file" accept=".xlsx" />
-      </div>
-      <div class="field" style="flex:0 0 auto;">
-       <label>&nbsp;</label>
-       <button class="btn btnGhost" onclick="uploadPolicies(true)">Dry Run</button>
-      </div>
-      <div class="field" style="flex:0 0 auto;">
-       <label>&nbsp;</label>
-       <button class="btn" onclick="uploadPolicies(false)">Upload</button>
-      </div>
-     </div>
-     <div class="hint" id="pol_upload_out" style="margin-top:10px;">Ready.</div>
-    </div>
-   </div>
-  </div>
-
-  <div id="panel-inbox" style="display:none;">
-   <div class="card">
-    <div class="cardHeader">
-     <h2>Team Inbox (Delivered Replies)</h2>
-     <span class="pill">Replies go to WhatsApp</span>
-    </div>
-    <div class="cardBody">
-     <div class="row" style="margin-bottom:10px;">
-      <div class="field">
-       <label>Search (phone / name / policy)</label>
-       <input id="inbox_search" placeholder="type to filter…" oninput="debouncedRefreshInbox()" />
-      </div>
-      <div class="field" style="flex:0 0 180px;">
-       <label>Status</label>
-       <select id="inbox_status" onchange="refreshInbox()">
-        <option value="">ALL</option>
-        <option>OPEN</option>
-        <option>PENDING</option>
-        <option>CLOSED</option>
-       </select>
-      </div>
-      <div class="field" style="flex:0 0 220px;">
-       <label>Assigned</label>
-       <select id="inbox_assigned" onchange="refreshInbox()">
-        <option value="">ALL</option>
-        <option value="unassigned">UNASSIGNED</option>
-       </select>
-      </div>
-      <div class="field" style="flex:0 0 260px;">
-       <label>Acting as (for replies/notes)</label>
-       <select id="acting_user"></select>
-      </div>
-     </div>
-
-     
-     <div class="card" style="margin-bottom:12px; border-radius: 16px;">
-      <div class="cardHeader">
-       <h2>Premium Reminders (Bulk + DB)</h2>
-       <span class="pill">Add-on</span>
-      </div>
-      <div class="cardBody">
-       <div class="row">
-        <div class="field" style="flex:0 0 180px;">
-         <label>DB scan (days ahead)</label>
-         <input id="rem_days" placeholder="3" value="3" />
-        </div>
-        <div class="field" style="flex:0 0 auto;">
-         <label>&nbsp;</label>
-         <button class="btn btnGhost" onclick="runDbReminders()">Run DB Reminders</button>
-        </div>
-        <div class="field">
-         <label>Upload Excel (.xlsx): phone, policy_number, premium_due_date, premium_amount</label>
-         <input id="xl_file" type="file" accept=".xlsx" />
-        </div>
-        <div class="field" style="flex:0 0 auto;">
-         <label>&nbsp;</label>
-         <button class="btn btnGhost" onclick="sendExcelReminders()">Send Excel Reminders</button>
-        </div>
-       </div>
-       <div class="hint" id="rem_out" style="margin-top:10px;">Ready.</div>
-      </div>
-     </div>
-     
-     <div class="inboxGrid">
-      <div>
-       <div class="convList" id="conv_list">
-        <div class="convItem"><span class="small">Loading…</span></div>
-       </div>
-       <div class="footer">Incoming WhatsApp messages appear via <span class="mono">/webhook</span>.</div>
-      </div>
-
-      <div>
-       <div class="row" style="margin-bottom:10px;">
-        <div class="field">
-         <label>Assign to</label>
-         <select id="assign_to"></select>
-        </div>
-        <div class="field" style="flex:0 0 180px;">
-         <label>Status</label>
-         <select id="conv_status">
-          <option>OPEN</option>
-          <option>PENDING</option>
-          <option>CLOSED</option>
-         </select>
-        </div>
-        <div class="field" style="flex:0 0 180px;">
-         <label>Priority</label>
-         <select id="conv_priority">
-          <option>LOW</option>
-          <option selected>NORMAL</option>
-          <option>HIGH</option>
-         </select>
-        </div>
-        <div style="flex:0 0 auto;">
-         <button class="btn btnGhost" onclick="saveConvMeta()">Save</button>
-        </div>
-       </div>
-
-       <div class="thread" id="thread">
-        <div class="small">Select a conversation to view messages.</div>
-       </div>
-
-       <div class="compose">
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo"></div>
         <div>
-         <label>Message (Reply or Note)</label>
-         <textarea id="compose_body" placeholder="Reply to customer (OUT) or internal note (NOTE)…"></textarea>
+          <h1>Policy Dashboard + Team Inbox</h1>
+          <div class="sub">Policy lookup, audit logs, and a shared team inbox for WhatsApp support</div>
         </div>
-        <div>
-         <label>Type</label>
-         <select id="compose_type">
-          <option value="OUT">Reply (OUT) — delivered</option>
-          <option value="NOTE">Internal Note</option>
-         </select>
-         <div style="height:10px;"></div>
-         <button class="btn" style="width:100%;" onclick="sendMessage()">Send</button>
-         <div class="hint">OUT is sent via WhatsApp Cloud API. NOTE is internal only.</div>
-        </div>
-       </div>
-
       </div>
-     </div>
-
+      <div class="right">
+        <span class="pill" id="dbpill">DB: loading…</span>
+        <span class="pill">Webhook: <span class="mono">/webhook</span></span>
+        <button class="btn btnGhost" onclick="refreshAll()">Refresh</button>
+      </div>
     </div>
-   </div>
+
+    <div class="tabs">
+      <div class="tab active" id="tab-lookup" onclick="showTab('lookup')">Policy Lookup</div>
+      <div class="tab" id="tab-policies" onclick="showTab('policies')">Policies</div>
+      <div class="tab" id="tab-inbox" onclick="showTab('inbox')">Team Inbox</div>
+      <div class="tab" id="tab-audit" onclick="showTab('audit')">Audit Logs</div>
+    </div>
+
+    <div id="panel-lookup">
+      <div class="grid">
+        <div class="card">
+          <div class="cardHeader">
+            <h2>Quick Policy Lookup</h2>
+            <span class="pill">POST /policy/lookup</span>
+          </div>
+          <div class="cardBody">
+            <div class="row">
+              <div class="field">
+                <label>Policy Number</label>
+                <input id="policy_number" placeholder="e.g. 12345678" />
+              </div>
+              <div class="field">
+                <label>Customer Phone (optional verification)</label>
+                <input id="phone" placeholder="+919876543210" />
+              </div>
+              <div class="field" style="flex: 0 0 180px;">
+                <label>Channel</label>
+                <select id="channel">
+                  <option>WHATSAPP</option>
+                  <option>WEB</option>
+                  <option>VOICE</option>
+                  <option>AGENT_APP</option>
+                </select>
+              </div>
+              <div style="flex:0 0 auto;">
+                <button class="btn" onclick="doLookup()">Lookup</button>
+              </div>
+            </div>
+
+            <div class="hint">
+              Lookup is DB-backed only (no hallucinations). WhatsApp replies are sent from Inbox tab and delivered via Cloud API.
+            </div>
+
+            <div id="lookup_result" class="result" style="display:none;"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="cardHeader">
+            <h2>WhatsApp Setup (Meta)</h2>
+            <span class="pill">Delivery enabled</span>
+          </div>
+          <div class="cardBody">
+            <div class="hint">
+              Set Meta webhook URL to <span class="mono">https://YOUR_DOMAIN/webhook</span><br/>
+              Env vars required:
+              <div class="mono" style="margin-top:8px;">
+                WHATSAPP_VERIFY_TOKEN<br/>
+                WHATSAPP_ACCESS_TOKEN<br/>
+                WHATSAPP_PHONE_NUMBER_ID<br/>
+              </div>
+              OUT messages from Inbox are delivered immediately.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-policies" style="display:none;">
+      <div class="card">
+        <div class="cardHeader">
+          <h2>Policies</h2>
+          <span class="pill">GET /admin/policies</span>
+        </div>
+        <div class="cardBody">
+          <div class="row" style="margin-bottom:10px;">
+            <div class="field">
+              <label>Search by policy number</label>
+              <input id="policy_search" placeholder="type to filter…" oninput="debouncedRefreshPolicies()" />
+            </div>
+          </div>
+          <div style="overflow:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Policy</th>
+                  <th>Status</th>
+                  <th>Next Due</th>
+                  <th>Maturity</th>
+                </tr>
+              </thead>
+              <tbody id="policies_tbody">
+                <tr><td colspan="4" class="small">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="footer">Tip: click a policy number to auto-fill lookup.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-inbox" style="display:none;">
+      <div class="card">
+        <div class="cardHeader">
+          <h2>Team Inbox (Delivered Replies)</h2>
+          <span class="pill">Replies go to WhatsApp</span>
+        </div>
+        <div class="cardBody">
+          <div class="row" style="margin-bottom:10px;">
+            <div class="field">
+              <label>Search (phone / name / policy)</label>
+              <input id="inbox_search" placeholder="type to filter…" oninput="debouncedRefreshInbox()" />
+            </div>
+            <div class="field" style="flex:0 0 180px;">
+              <label>Status</label>
+              <select id="inbox_status" onchange="refreshInbox()">
+                <option value="">ALL</option>
+                <option>OPEN</option>
+                <option>PENDING</option>
+                <option>CLOSED</option>
+              </select>
+            </div>
+            <div class="field" style="flex:0 0 220px;">
+              <label>Assigned</label>
+              <select id="inbox_assigned" onchange="refreshInbox()">
+                <option value="">ALL</option>
+                <option value="unassigned">UNASSIGNED</option>
+              </select>
+            </div>
+            <div class="field" style="flex:0 0 260px;">
+              <label>Acting as (for replies/notes)</label>
+              <select id="acting_user"></select>
+            </div>
+          </div>
+
+          <div class="inboxGrid">
+            <div>
+              <div class="convList" id="conv_list">
+                <div class="convItem"><span class="small">Loading…</span></div>
+              </div>
+              <div class="footer">Incoming WhatsApp messages appear via <span class="mono">/webhook</span>.</div>
+            </div>
+
+            <div>
+              <div class="row" style="margin-bottom:10px;">
+                <div class="field">
+                  <label>Assign to</label>
+                  <select id="assign_to"></select>
+                </div>
+                <div class="field" style="flex:0 0 180px;">
+                  <label>Status</label>
+                  <select id="conv_status">
+                    <option>OPEN</option>
+                    <option>PENDING</option>
+                    <option>CLOSED</option>
+                  </select>
+                </div>
+                <div class="field" style="flex:0 0 180px;">
+                  <label>Priority</label>
+                  <select id="conv_priority">
+                    <option>LOW</option>
+                    <option selected>NORMAL</option>
+                    <option>HIGH</option>
+                  </select>
+                </div>
+                <div style="flex:0 0 auto;">
+                  <button class="btn btnGhost" onclick="saveConvMeta()">Save</button>
+                </div>
+              </div>
+
+              <div class="thread" id="thread">
+                <div class="small">Select a conversation to view messages.</div>
+              </div>
+
+              <div class="compose">
+                <div>
+                  <label>Message (Reply or Note)</label>
+                  <textarea id="compose_body" placeholder="Reply to customer (OUT) or internal note (NOTE)…"></textarea>
+                </div>
+                <div>
+                  <label>Type</label>
+                  <select id="compose_type">
+                    <option value="OUT">Reply (OUT) — delivered</option>
+                    <option value="NOTE">Internal Note</option>
+                  </select>
+                  <div style="height:10px;"></div>
+                  <button class="btn" style="width:100%;" onclick="sendMessage()">Send</button>
+                  <div class="hint">OUT is sent via WhatsApp Cloud API. NOTE is internal only.</div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-audit" style="display:none;">
+      <div class="card">
+        <div class="cardHeader">
+          <h2>Audit Logs</h2>
+          <span class="pill">GET /admin/audit</span>
+        </div>
+        <div class="cardBody">
+          <div style="overflow:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Channel</th>
+                  <th>Action</th>
+                  <th>Policy</th>
+                  <th>Result</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="audit_tbody">
+                <tr><td colspan="6" class="small">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div>
-
-  <div id="panel-audit" style="display:none;">
-   <div class="card">
-    <div class="cardHeader">
-     <h2>Audit Logs</h2>
-     <span class="pill">GET /admin/audit</span>
-    </div>
-    <div class="cardBody">
-     <div style="overflow:auto;">
-      <table>
-       <thead>
-        <tr>
-         <th>Time</th>
-         <th>Channel</th>
-         <th>Action</th>
-         <th>Policy</th>
-         <th>Result</th>
-         <th>Reason</th>
-        </tr>
-       </thead>
-       <tbody id="audit_tbody">
-        <tr><td colspan="6" class="small">Loading…</td></tr>
-       </tbody>
-      </table>
-     </div>
-    </div>
-   </div>
-  </div>
-
- </div>
 
 <script>
- let debounceTimer = null;
- let inboxDebounce = null;
- let selectedConvId = null;
- let teamUsers = [];
+  let debounceTimer = null;
+  let inboxDebounce = null;
+  let selectedConvId = null;
+  let teamUsers = [];
 
- function $(id){ return document.getElementById(id); }
+  function $(id){ return document.getElementById(id); }
 
- function safe(v){
-  if (v === null || v === undefined || v === "") return "Not available";
-  return v;
- }
-
- function fmtINR(v){
-  if (v === null || v === undefined) return "Not available";
-  try{
-   return "₹" + Number(v).toLocaleString("en-IN", {minimumFractionDigits:2, maximumFractionDigits:2});
-  }catch(e){
-   return v;
+  function safe(v){
+    if (v === null || v === undefined || v === "") return "Not available";
+    return v;
   }
- }
 
- function setActiveTab(name){
-  ["lookup","policies","inbox","audit"].forEach(t => {
-   $("tab-"+t).classList.toggle("active", t===name);
-   $("panel-"+t).style.display = (t===name) ? "block" : "none";
-  });
- }
-
- function showTab(name){
-  setActiveTab(name);
-  if(name === "policies") refreshPolicies();
-  if(name === "audit") refreshAudit();
-  if(name === "inbox") refreshInbox();
- }
-
- async function doLookup(){
-  const policy_number = $("policy_number").value.trim();
-  const phone = $("phone").value.trim();
-  const channel = $("channel").value;
-
-  if(!policy_number){ alert("Enter policy number"); return; }
-
-  const payload = {
-   policy_number,
-   customer_phone_e164: phone ? phone : null,
-   channel,
-   request_id: "dash-" + Date.now()
-  };
-
-  const box = $("lookup_result");
-  box.style.display = "block";
-  box.innerHTML = "<div class='small'>Looking up…</div>";
-
-  try{
-   const resp = await fetch("/policy/lookup", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify(payload)
-   });
-
-   const data = await resp.json();
-   if(!resp.ok){
-    box.innerHTML = `<div class="resultTitle">
-     <div><b>Lookup Failed</b></div>
-     <span class="badge bad">Error</span>
-    </div>
-    <div class="small">${safe(data.detail)}</div>`;
-    await refreshAudit();
-    return;
-   }
-
-   const badge = data.found ? `<span class="badge good">FOUND</span>` : `<span class="badge bad">NOT FOUND</span>`;
-   box.innerHTML = `
-    <div class="resultTitle">
-     <div><b>Result</b> <span class="mono">${safe(data.policy_number)}</span></div>
-     ${badge}
-    </div>
-    <div class="small">${safe(data.message)}</div>
-
-    <div class="kv">
-     <div class="k"><div class="t">Status</div><div class="v">${safe(data.status)}</div></div>
-     <div class="k"><div class="t">Plan</div><div class="v">${safe(data.plan_name)}</div></div>
-
-     <div class="k"><div class="t">Premium Amount</div><div class="v">${fmtINR(data.premium_amount)}</div></div>
-     <div class="k"><div class="t">Next Premium Due</div><div class="v">${safe(data.next_premium_due_date)}</div></div>
-
-     <div class="k"><div class="t">Maturity Date</div><div class="v">${safe(data.maturity_date)}</div></div>
-     <div class="k"><div class="t">Expected Maturity</div><div class="v">${fmtINR(data.maturity_amount_expected)}</div></div>
-
-     <div class="k"><div class="t">Last Payment Date</div><div class="v">${safe(data.last_payment_date)}</div></div>
-     <div class="k"><div class="t">Last Payment</div><div class="v">${fmtINR(data.last_payment_amount)} (${safe(data.last_payment_status)})</div></div>
-    </div>
-   `;
-
-   await refreshAudit();
-  }catch(e){
-   box.innerHTML = `<div class="small">Network error: ${e}</div>`;
+  function fmtINR(v){
+    if (v === null || v === undefined) return "Not available";
+    try{
+      return "₹" + Number(v).toLocaleString("en-IN", {minimumFractionDigits:2, maximumFractionDigits:2});
+    }catch(e){
+      return v;
+    }
   }
- }
 
- async function uploadPolicies(dry){
-  const out = $("pol_upload_out");
-  const f = $("pol_xl").files[0];
-  if(!f){ alert("Please choose an Excel .xlsx file"); return; }
-  out.innerHTML = dry ? "Validating Excel (dry run)…" : "Uploading Excel and importing…";
-  try{
-   const fd = new FormData();
-   fd.append("file", f);
-   const resp = await fetch(`/admin/policies/upload?dry_run=${dry?"true":"false"}`, {method:"POST", body: fd});
-   const data = await resp.json();
-   if(!resp.ok){ out.innerHTML = "Failed: " + escapeHtml(data.detail || "error"); return; }
-   out.innerHTML = `Done. Customers: <b>${data.created_customers}</b>, Policies: <b>${data.created_policies}</b>, Skipped: <b>${data.skipped}</b>.`;
-   await refreshPolicies();
-   await refreshAudit();
-  }catch(e){ out.innerHTML = "Network error: " + escapeHtml(String(e)); }
- }
-
- async function refreshPolicies(){
-  const q = ($("policy_search") ? $("policy_search").value.trim() : "");
-  const url = q ? `/admin/policies?q=${encodeURIComponent(q)}&limit=50` : `/admin/policies?limit=50`;
-  const tbody = $("policies_tbody");
-  tbody.innerHTML = `<tr><td colspan="4" class="small">Loading…</td></tr>`;
-
-  try{
-   const resp = await fetch(url);
-   const data = await resp.json();
-   const items = data.items || [];
-   if(items.length === 0){
-    tbody.innerHTML = `<tr><td colspan="4" class="small">No policies found.</td></tr>`;
-    return;
-   }
-
-   tbody.innerHTML = items.map(p => {
-    const pn = safe(p.policy_number);
-    return `
-     <tr>
-      <td><a class="link mono" href="#" onclick="pickPolicy('${pn}'); return false;">${pn}</a></td>
-      <td>${safe(p.status)}</td>
-      <td class="mono">${safe(p.next_premium_due_date)}</td>
-      <td class="mono">${safe(p.maturity_date)}</td>
-     </tr>
-    `;
-   }).join("");
-  }catch(e){
-   tbody.innerHTML = `<tr><td colspan="4" class="small">Error loading policies.</td></tr>`;
+  function setActiveTab(name){
+    ["lookup","policies","inbox","audit"].forEach(t => {
+      $("tab-"+t).classList.toggle("active", t===name);
+      $("panel-"+t).style.display = (t===name) ? "block" : "none";
+    });
   }
- }
 
- function debouncedRefreshPolicies(){
-  if(debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(refreshPolicies, 250);
- }
-
- function pickPolicy(pn){
-  setActiveTab("lookup");
-  $("policy_number").value = pn;
-  doLookup();
- }
-
- async function refreshAudit(){
-  const tbody = $("audit_tbody");
-  tbody.innerHTML = `<tr><td colspan="6" class="small">Loading…</td></tr>`;
-  try{
-   const resp = await fetch("/admin/audit?limit=100");
-   const data = await resp.json();
-   const items = data.items || [];
-   if(items.length === 0){
-    tbody.innerHTML = `<tr><td colspan="6" class="small">No audit logs yet.</td></tr>`;
-    return;
-   }
-   tbody.innerHTML = items.map(a => {
-    const ok = a.success ? `<span class="badge good">OK</span>` : `<span class="badge bad">FAIL</span>`;
-    return `
-     <tr>
-      <td class="mono">${safe(a.created_at)}</td>
-      <td>${safe(a.channel)}</td>
-      <td>${safe(a.action)}</td>
-      <td class="mono">${safe(a.policy_number)}</td>
-      <td>${ok}</td>
-      <td class="mono">${safe(a.reason)}</td>
-     </tr>
-    `;
-   }).join("");
-  }catch(e){
-   tbody.innerHTML = `<tr><td colspan="6" class="small">Error loading audit logs.</td></tr>`;
+  function showTab(name){
+    setActiveTab(name);
+    if(name === "policies") refreshPolicies();
+    if(name === "audit") refreshAudit();
+    if(name === "inbox") refreshInbox();
   }
- }
 
- async function loadTeam(){
-  const resp = await fetch("/admin/team");
-  const data = await resp.json();
-  teamUsers = data.items || [];
+  async function doLookup(){
+    const policy_number = $("policy_number").value.trim();
+    const phone = $("phone").value.trim();
+    const channel = $("channel").value;
 
-  $("acting_user").innerHTML = teamUsers.map(u => `<option value="${u.id}">${u.full_name} (${u.role})</option>`).join("");
-  $("assign_to").innerHTML = `<option value="">UNASSIGNED</option>` + teamUsers.map(u => `<option value="${u.id}">${u.full_name}</option>`).join("");
+    if(!policy_number){ alert("Enter policy number"); return; }
 
-  const filt = $("inbox_assigned");
-  const base = `<option value="">ALL</option><option value="unassigned">UNASSIGNED</option>`;
-  const more = teamUsers.map(u => `<option value="${u.id}">${u.full_name}</option>`).join("");
-  filt.innerHTML = base + more;
- }
+    const payload = {
+      policy_number,
+      customer_phone_e164: phone ? phone : null,
+      channel,
+      request_id: "dash-" + Date.now()
+    };
 
- function debouncedRefreshInbox(){
-  if(inboxDebounce) clearTimeout(inboxDebounce);
-  inboxDebounce = setTimeout(refreshInbox, 250);
- }
+    const box = $("lookup_result");
+    box.style.display = "block";
+    box.innerHTML = "<div class='small'>Looking up…</div>";
 
- function statusChip(status){
-  const s = (status||"").toUpperCase();
-  if(s === "OPEN") return `<span class="chip good">OPEN</span>`;
-  if(s === "PENDING") return `<span class="chip warn">PENDING</span>`;
-  if(s === "CLOSED") return `<span class="chip bad">CLOSED</span>`;
-  return `<span class="chip">${safe(status)}</span>`;
- }
+    try{
+      const resp = await fetch("/policy/lookup", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify(payload)
+      });
 
- async function refreshInbox(){
-  const q = $("inbox_search").value.trim();
-  const status = $("inbox_status").value.trim();
-  const assigned = $("inbox_assigned").value.trim();
+      const data = await resp.json();
+      if(!resp.ok){
+        box.innerHTML = `<div class="resultTitle">
+          <div><b>Lookup Failed</b></div>
+          <span class="badge bad">Error</span>
+        </div>
+        <div class="small">${safe(data.detail)}</div>`;
+        await refreshAudit();
+        return;
+      }
 
-  let url = `/admin/inbox/conversations?limit=120`;
-  if(q) url += `&q=${encodeURIComponent(q)}`;
-  if(status) url += `&status=${encodeURIComponent(status)}`;
-  if(assigned) url += `&assigned_to=${encodeURIComponent(assigned)}`;
+      const badge = data.found ? `<span class="badge good">FOUND</span>` : `<span class="badge bad">NOT FOUND</span>`;
+      box.innerHTML = `
+        <div class="resultTitle">
+          <div><b>Result</b> <span class="mono">${safe(data.policy_number)}</span></div>
+          ${badge}
+        </div>
+        <div class="small">${safe(data.message)}</div>
 
-  const list = $("conv_list");
-  list.innerHTML = `<div class="convItem"><span class="small">Loading…</span></div>`;
+        <div class="kv">
+          <div class="k"><div class="t">Status</div><div class="v">${safe(data.status)}</div></div>
+          <div class="k"><div class="t">Plan</div><div class="v">${safe(data.plan_name)}</div></div>
 
-  try{
-   const resp = await fetch(url);
-   const data = await resp.json();
-   const items = data.items || [];
-   if(items.length === 0){
-    list.innerHTML = `<div class="convItem"><span class="small">No conversations.</span></div>`;
-    $("thread").innerHTML = `<div class="small">No conversation selected.</div>`;
-    selectedConvId = null;
-    return;
-   }
+          <div class="k"><div class="t">Premium Amount</div><div class="v">${fmtINR(data.premium_amount)}</div></div>
+          <div class="k"><div class="t">Next Premium Due</div><div class="v">${safe(data.next_premium_due_date)}</div></div>
 
-   list.innerHTML = items.map(c => {
-    const active = (c.id === selectedConvId) ? "active" : "";
-    const title = c.customer_name ? c.customer_name : c.customer_phone;
-    const line2 = `${c.customer_phone} • ${safe(c.policy_number)}`;
-    const asg = c.assigned_to_name ? `Assigned: ${c.assigned_to_name}` : "Unassigned";
-    return `
-     <div class="convItem ${active}" onclick="openConv('${c.id}')">
-      <div class="convTop">
-       <div class="convName">${title}</div>
-       ${statusChip(c.status)}
+          <div class="k"><div class="t">Maturity Date</div><div class="v">${safe(data.maturity_date)}</div></div>
+          <div class="k"><div class="t">Expected Maturity</div><div class="v">${fmtINR(data.maturity_amount_expected)}</div></div>
+
+          <div class="k"><div class="t">Last Payment Date</div><div class="v">${safe(data.last_payment_date)}</div></div>
+          <div class="k"><div class="t">Last Payment</div><div class="v">${fmtINR(data.last_payment_amount)} (${safe(data.last_payment_status)})</div></div>
+        </div>
+      `;
+
+      await refreshAudit();
+    }catch(e){
+      box.innerHTML = `<div class="small">Network error: ${e}</div>`;
+    }
+  }
+
+  async function refreshPolicies(){
+    const q = ($("policy_search") ? $("policy_search").value.trim() : "");
+    const url = q ? `/admin/policies?q=${encodeURIComponent(q)}&limit=50` : `/admin/policies?limit=50`;
+    const tbody = $("policies_tbody");
+    tbody.innerHTML = `<tr><td colspan="4" class="small">Loading…</td></tr>`;
+
+    try{
+      const resp = await fetch(url);
+      const data = await resp.json();
+      const items = data.items || [];
+      if(items.length === 0){
+        tbody.innerHTML = `<tr><td colspan="4" class="small">No policies found.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = items.map(p => {
+        const pn = safe(p.policy_number);
+        return `
+          <tr>
+            <td><a class="link mono" href="#" onclick="pickPolicy('${pn}'); return false;">${pn}</a></td>
+            <td>${safe(p.status)}</td>
+            <td class="mono">${safe(p.next_premium_due_date)}</td>
+            <td class="mono">${safe(p.maturity_date)}</td>
+          </tr>
+        `;
+      }).join("");
+    }catch(e){
+      tbody.innerHTML = `<tr><td colspan="4" class="small">Error loading policies.</td></tr>`;
+    }
+  }
+
+  function debouncedRefreshPolicies(){
+    if(debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(refreshPolicies, 250);
+  }
+
+  function pickPolicy(pn){
+    setActiveTab("lookup");
+    $("policy_number").value = pn;
+    doLookup();
+  }
+
+  async function refreshAudit(){
+    const tbody = $("audit_tbody");
+    tbody.innerHTML = `<tr><td colspan="6" class="small">Loading…</td></tr>`;
+    try{
+      const resp = await fetch("/admin/audit?limit=100");
+      const data = await resp.json();
+      const items = data.items || [];
+      if(items.length === 0){
+        tbody.innerHTML = `<tr><td colspan="6" class="small">No audit logs yet.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = items.map(a => {
+        const ok = a.success ? `<span class="badge good">OK</span>` : `<span class="badge bad">FAIL</span>`;
+        return `
+          <tr>
+            <td class="mono">${safe(a.created_at)}</td>
+            <td>${safe(a.channel)}</td>
+            <td>${safe(a.action)}</td>
+            <td class="mono">${safe(a.policy_number)}</td>
+            <td>${ok}</td>
+            <td class="mono">${safe(a.reason)}</td>
+          </tr>
+        `;
+      }).join("");
+    }catch(e){
+      tbody.innerHTML = `<tr><td colspan="6" class="small">Error loading audit logs.</td></tr>`;
+    }
+  }
+
+  async function loadTeam(){
+    const resp = await fetch("/admin/team");
+    const data = await resp.json();
+    teamUsers = data.items || [];
+
+    $("acting_user").innerHTML = teamUsers.map(u => `<option value="${u.id}">${u.full_name} (${u.role})</option>`).join("");
+    $("assign_to").innerHTML = `<option value="">UNASSIGNED</option>` + teamUsers.map(u => `<option value="${u.id}">${u.full_name}</option>`).join("");
+
+    const filt = $("inbox_assigned");
+    const base = `<option value="">ALL</option><option value="unassigned">UNASSIGNED</option>`;
+    const more = teamUsers.map(u => `<option value="${u.id}">${u.full_name}</option>`).join("");
+    filt.innerHTML = base + more;
+  }
+
+  function debouncedRefreshInbox(){
+    if(inboxDebounce) clearTimeout(inboxDebounce);
+    inboxDebounce = setTimeout(refreshInbox, 250);
+  }
+
+  function statusChip(status){
+    const s = (status||"").toUpperCase();
+    if(s === "OPEN") return `<span class="chip good">OPEN</span>`;
+    if(s === "PENDING") return `<span class="chip warn">PENDING</span>`;
+    if(s === "CLOSED") return `<span class="chip bad">CLOSED</span>`;
+    return `<span class="chip">${safe(status)}</span>`;
+  }
+
+  async function refreshInbox(){
+    const q = $("inbox_search").value.trim();
+    const status = $("inbox_status").value.trim();
+    const assigned = $("inbox_assigned").value.trim();
+
+    let url = `/admin/inbox/conversations?limit=120`;
+    if(q) url += `&q=${encodeURIComponent(q)}`;
+    if(status) url += `&status=${encodeURIComponent(status)}`;
+    if(assigned) url += `&assigned_to=${encodeURIComponent(assigned)}`;
+
+    const list = $("conv_list");
+    list.innerHTML = `<div class="convItem"><span class="small">Loading…</span></div>`;
+
+    try{
+      const resp = await fetch(url);
+      const data = await resp.json();
+      const items = data.items || [];
+      if(items.length === 0){
+        list.innerHTML = `<div class="convItem"><span class="small">No conversations.</span></div>`;
+        $("thread").innerHTML = `<div class="small">No conversation selected.</div>`;
+        selectedConvId = null;
+        return;
+      }
+
+      list.innerHTML = items.map(c => {
+        const active = (c.id === selectedConvId) ? "active" : "";
+        const title = c.customer_name ? c.customer_name : c.customer_phone;
+        const line2 = `${c.customer_phone} • ${safe(c.policy_number)}`;
+        const asg = c.assigned_to_name ? `Assigned: ${c.assigned_to_name}` : "Unassigned";
+        return `
+          <div class="convItem ${active}" onclick="openConv('${c.id}')">
+            <div class="convTop">
+              <div class="convName">${title}</div>
+              ${statusChip(c.status)}
+            </div>
+            <div class="convMeta">${line2}</div>
+            <div class="convMeta">${asg} • <span class="mono">${safe(c.last_message_at)}</span></div>
+          </div>
+        `;
+      }).join("");
+
+      if(!selectedConvId){
+        openConv(items[0].id);
+      }
+    }catch(e){
+      list.innerHTML = `<div class="convItem"><span class="small">Error loading inbox.</span></div>`;
+    }
+  }
+
+  async function openConv(id){
+    selectedConvId = id;
+    await refreshInbox(); // easy re-render to highlight active
+    await loadConvDetail();
+  }
+
+  async function loadConvDetail(){
+    if(!selectedConvId){
+      $("thread").innerHTML = `<div class="small">Select a conversation to view messages.</div>`;
+      return;
+    }
+    const resp = await fetch(`/admin/inbox/conversations/${selectedConvId}`);
+    const data = await resp.json();
+
+    const conv = data.conversation;
+    const msgs = data.messages || [];
+
+    $("conv_status").value = conv.status || "OPEN";
+    $("conv_priority").value = conv.priority || "NORMAL";
+    $("assign_to").value = conv.assigned_to_user_id || "";
+
+    const header = `
+      <div class="hint" style="margin:0 0 10px;">
+        <b>${safe(conv.customer_name) || conv.customer_phone}</b><br/>
+        <span class="mono">${conv.customer_phone}</span> • Policy: <span class="mono">${safe(conv.policy_number)}</span> • Channel: <span class="mono">${safe(conv.channel)}</span>
       </div>
-      <div class="convMeta">${line2}</div>
-      <div class="convMeta">${asg} • <span class="mono">${safe(c.last_message_at)}</span></div>
-     </div>
     `;
-   }).join("");
 
-   if(!selectedConvId){
-    openConv(items[0].id);
-   }
-  }catch(e){
-   list.innerHTML = `<div class="convItem"><span class="small">Error loading inbox.</span></div>`;
-  }
- }
+    const body = msgs.map(m => {
+      const cls = (m.direction || "").toLowerCase();
+      const who = m.actor_name ? `${m.direction} • ${m.actor_name}` : `${m.direction}`;
+      return `
+        <div class="msg ${cls}">
+          <div class="msgHead">
+            <div>${who}</div>
+            <div class="mono">${safe(m.created_at)}</div>
+          </div>
+          <div>${escapeHtml(m.body)}</div>
+        </div>
+      `;
+    }).join("");
 
- async function openConv(id){
-  selectedConvId = id;
-  await refreshInbox(); // easy re-render to highlight active
-  await loadConvDetail();
- }
-
- async function loadConvDetail(){
-  if(!selectedConvId){
-   $("thread").innerHTML = `<div class="small">Select a conversation to view messages.</div>`;
-   return;
-  }
-  const resp = await fetch(`/admin/inbox/conversations/${selectedConvId}`);
-  const data = await resp.json();
-
-  const conv = data.conversation;
-  const msgs = data.messages || [];
-
-  $("conv_status").value = conv.status || "OPEN";
-  $("conv_priority").value = conv.priority || "NORMAL";
-  $("assign_to").value = conv.assigned_to_user_id || "";
-
-  const header = `
-   <div class="hint" style="margin:0 0 10px;">
-    <b>${safe(conv.customer_name) || conv.customer_phone}</b><br/>
-    <span class="mono">${conv.customer_phone}</span> • Policy: <span class="mono">${safe(conv.policy_number)}</span> • Channel: <span class="mono">${safe(conv.channel)}</span>
-   </div>
-  `;
-
-  const body = msgs.map(m => {
-   const cls = (m.direction || "").toLowerCase();
-   const who = m.actor_name ? `${m.direction} • ${m.actor_name}` : `${m.direction}`;
-   return `
-    <div class="msg ${cls}">
-     <div class="msgHead">
-      <div>${who}</div>
-      <div class="mono">${safe(m.created_at)}</div>
-     </div>
-     <div>${escapeHtml(m.body)}</div>
-    </div>
-   `;
-  }).join("");
-
-  $("thread").innerHTML = header + (body || `<div class="small">No messages in this conversation yet.</div>`);
-  $("thread").scrollTop = $("thread").scrollHeight;
- }
-
- function escapeHtml(text){
-  const div = document.createElement("div");
-  div.innerText = text || "";
-  return div.innerHTML;
- }
-
- async function saveConvMeta(){
-  if(!selectedConvId){ alert("Select a conversation"); return; }
-  const assigned = $("assign_to").value;
-  const status = $("conv_status").value;
-  const priority = $("conv_priority").value;
-
-  const payload = { assigned_to_user_id: assigned ? assigned : "", status, priority };
-
-  const resp = await fetch(`/admin/inbox/conversations/${selectedConvId}/assign`, {
-   method: "POST",
-   headers: {"Content-Type":"application/json"},
-   body: JSON.stringify(payload)
-  });
-
-  if(!resp.ok){
-   const d = await resp.json();
-   alert("Failed: " + (d.detail || "error"));
-   return;
-  }
-  await refreshInbox();
-  await loadConvDetail();
- }
-
- async function sendMessage(){
-  if(!selectedConvId){ alert("Select a conversation"); return; }
-  const body = $("compose_body").value.trim();
-  if(!body){ alert("Type a message"); return; }
-
-  const direction = $("compose_type").value;
-  const actor_user_id = $("acting_user").value;
-  const payload = { actor_user_id, direction, body };
-
-  const resp = await fetch(`/admin/inbox/conversations/${selectedConvId}/send`, {
-   method: "POST",
-   headers: {"Content-Type":"application/json"},
-   body: JSON.stringify(payload)
-  });
-
-  if(!resp.ok){
-   const d = await resp.json();
-   alert("Failed: " + (d.detail || "error"));
-   return;
+    $("thread").innerHTML = header + (body || `<div class="small">No messages in this conversation yet.</div>`);
+    $("thread").scrollTop = $("thread").scrollHeight;
   }
 
-  $("compose_body").value = "";
-  await loadConvDetail();
-  await refreshInbox();
- }
-
-
- async function runDbReminders(){
-  const out = $("rem_out");
-  out.innerHTML = "Running DB reminder scan…";
-  const days = ($("rem_days").value || "3").trim();
-  try{
-   const resp = await fetch(`/admin/reminders/run?days_ahead=${encodeURIComponent(days)}&dry_run=false`, {method:"POST"});
-   const data = await resp.json();
-   if(!resp.ok){
-    out.innerHTML = "Failed: " + escapeHtml(data.detail || "error");
-    return;
-   }
-   out.innerHTML = `Done. Scanned: <b>${data.scanned}</b>, Sent: <b>${data.sent}</b>, Skipped: <b>${data.skipped}</b>, Errors: <b>${data.errors}</b>.`;
-   await refreshInbox();
-   await refreshAudit();
-  }catch(e){
-   out.innerHTML = "Network error: " + escapeHtml(String(e));
+  function escapeHtml(text){
+    const div = document.createElement("div");
+    div.innerText = text || "";
+    return div.innerHTML;
   }
- }
 
- async function sendExcelReminders(){
-  const out = $("rem_out");
-  const f = $("xl_file").files[0];
-  if(!f){ alert("Please choose an Excel .xlsx file"); return; }
-  out.innerHTML = "Uploading Excel and sending reminders…";
-  try{
-   const fd = new FormData();
-   fd.append("file", f);
-   const resp = await fetch(`/admin/broadcast/premium?dry_run=false`, {method:"POST", body: fd});
-   const data = await resp.json();
-   if(!resp.ok){
-    out.innerHTML = "Failed: " + escapeHtml(data.detail || "error");
-    return;
-   }
-   out.innerHTML = `Done. Sent: <b>${data.sent}</b>, Skipped: <b>${data.skipped}</b>, Errors: <b>${data.errors}</b>.`;
-   await refreshInbox();
-   await refreshAudit();
-  }catch(e){
-   out.innerHTML = "Network error: " + escapeHtml(String(e));
+  async function saveConvMeta(){
+    if(!selectedConvId){ alert("Select a conversation"); return; }
+    const assigned = $("assign_to").value;
+    const status = $("conv_status").value;
+    const priority = $("conv_priority").value;
+
+    const payload = { assigned_to_user_id: assigned ? assigned : "", status, priority };
+
+    const resp = await fetch(`/admin/inbox/conversations/${selectedConvId}/assign`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+
+    if(!resp.ok){
+      const d = await resp.json();
+      alert("Failed: " + (d.detail || "error"));
+      return;
+    }
+    await refreshInbox();
+    await loadConvDetail();
   }
- }
+
+  async function sendMessage(){
+    if(!selectedConvId){ alert("Select a conversation"); return; }
+    const body = $("compose_body").value.trim();
+    if(!body){ alert("Type a message"); return; }
+
+    const direction = $("compose_type").value;
+    const actor_user_id = $("acting_user").value;
+    const payload = { actor_user_id, direction, body };
+
+    const resp = await fetch(`/admin/inbox/conversations/${selectedConvId}/send`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+
+    if(!resp.ok){
+      const d = await resp.json();
+      alert("Failed: " + (d.detail || "error"));
+      return;
+    }
+
+    $("compose_body").value = "";
+    await loadConvDetail();
+    await refreshInbox();
+  }
 
   async function refreshAll(){
-  await refreshPolicies();
-  await refreshAudit();
-  await refreshInbox();
- }
+    await refreshPolicies();
+    await refreshAudit();
+    await refreshInbox();
+  }
 
- async function detectDb(){
-  const pill = $("dbpill");
-  const v = "{{DBURL}}";
-  pill.textContent = "DB: " + (v.startsWith("sqlite") ? "SQLite" : "Postgres");
- }
+  async function detectDb(){
+    const pill = $("dbpill");
+    const v = "{{DBURL}}";
+    pill.textContent = "DB: " + (v.startsWith("sqlite") ? "SQLite" : "Postgres");
+  }
 
- (async () => {
-  await detectDb();
-  await loadTeam();
-  await refreshPolicies();
-  await refreshAudit();
-  await refreshInbox();
- })();
+  (async () => {
+    await detectDb();
+    await loadTeam();
+    await refreshPolicies();
+    await refreshAudit();
+    await refreshInbox();
+  })();
 </script>
 </body>
 </html>
@@ -2636,58 +1846,58 @@ DASHBOARD_HTML = r"""
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-  html = DASHBOARD_HTML.replace("{{DBURL}}", DATABASE_URL)
-  return HTMLResponse(content=html, status_code=200)
+    html = DASHBOARD_HTML.replace("{{DBURL}}", DATABASE_URL)
+    return HTMLResponse(content=html, status_code=200)
 
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy_policy():
-  return """
-  <html>
-  <head><title>Privacy Policy</title></head>
-  <body style="font-family: Arial; max-width: 800px; margin: auto;">
-    <h1>Privacy Policy</h1>
+    return """
+    <html>
+    <head><title>Privacy Policy</title></head>
+    <body style="font-family: Arial; max-width: 800px; margin: auto;">
+        <h1>Privacy Policy</h1>
 
-    <p>This application uses WhatsApp Cloud API to send and receive messages
-    on behalf of the business.</p>
+        <p>This application uses WhatsApp Cloud API to send and receive messages
+        on behalf of the business.</p>
 
-    <h3>Data We Collect</h3>
-    <ul>
-      <li>Phone number</li>
-      <li>Message content sent by users</li>
-    </ul>
+        <h3>Data We Collect</h3>
+        <ul>
+            <li>Phone number</li>
+            <li>Message content sent by users</li>
+        </ul>
 
-    <h3>How We Use Data</h3>
-    <ul>
-      <li>To respond to user queries</li>
-      <li>To provide customer support</li>
-    </ul>
+        <h3>How We Use Data</h3>
+        <ul>
+            <li>To respond to user queries</li>
+            <li>To provide customer support</li>
+        </ul>
 
-    <h3>Data Storage</h3>
-    <p>Messages are processed in real-time and are not sold or shared with third parties.</p>
+        <h3>Data Storage</h3>
+        <p>Messages are processed in real-time and are not sold or shared with third parties.</p>
 
-    <h3>Contact</h3>
-    <p>Email: support@nathinvestments.com</p>
+        <h3>Contact</h3>
+        <p>Email: support@nathinvestments.com</p>
 
-    <p>Last updated: 2025</p>
-  </body>
-  </html>
-  """
+        <p>Last updated: 2025</p>
+    </body>
+    </html>
+    """
 
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-  return HTMLResponse(
-    """
-    <html><body style="font-family:system-ui;padding:24px">
-     <h2>Policy Lookup + Team Inbox (WhatsApp Delivery) is running</h2>
-     <ul>
-      <li><a href="/dashboard">Open Dashboard</a></li>
-      <li><code>GET/POST /webhook</code> (Meta WhatsApp webhook)</li>
-      <li><code>POST /policy/lookup</code></li>
-      <li><code>POST /admin/inbox/conversations/&lt;id&gt;/send</code> (delivers if OUT)</li>
-     </ul>
-    </body></html>
-    """
-  )
+    return HTMLResponse(
+        """
+        <html><body style="font-family:system-ui;padding:24px">
+          <h2>Policy Lookup + Team Inbox (WhatsApp Delivery) is running</h2>
+          <ul>
+            <li><a href="/dashboard">Open Dashboard</a></li>
+            <li><code>GET/POST /webhook</code> (Meta WhatsApp webhook)</li>
+            <li><code>POST /policy/lookup</code></li>
+            <li><code>POST /admin/inbox/conversations/&lt;id&gt;/send</code> (delivers if OUT)</li>
+          </ul>
+        </body></html>
+        """
+    )
