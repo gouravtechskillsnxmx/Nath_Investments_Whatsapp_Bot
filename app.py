@@ -908,8 +908,15 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                     # update conv fields if new info appears
                     if customer_name and not conv.customer_name:
                         conv.customer_name = customer_name
-                    if policy_number and not conv.policy_number:
-                        conv.policy_number = policy_number
+                    if policy_number:
+                        # Update the conversation's last-selected policy ONLY if it is a real policy in DB.
+                        # This prevents stale/mis-attached policy numbers from being used for later 'details' messages.
+                        try:
+                            _pol = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
+                            if _pol:
+                                conv.policy_number = policy_number
+                        except Exception:
+                            pass
 
                     conv.last_message_at = now_utc()
                     conv.updated_at = now_utc()
