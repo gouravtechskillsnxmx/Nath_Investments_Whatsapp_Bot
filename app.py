@@ -533,6 +533,7 @@ def _ensure_inbox_conversation(db: Session, *, customer_phone: str, customer_nam
       channel="WHATSAPP",
       customer_phone=customer_phone,
       customer_name=customer_name,
+      policy_number=policy_number,
       status="OPEN",
       priority="NORMAL",
       last_message_at=now_utc(),
@@ -811,6 +812,7 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
               channel="WHATSAPP",
               customer_phone=customer_phone,
               customer_name=customer_name,
+              policy_number=policy_number,
               status="OPEN",
               priority="NORMAL",
               last_message_at=now_utc(),
@@ -823,6 +825,9 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
           # update conv fields if new info appears
           if customer_name and not conv.customer_name:
             conv.customer_name = customer_name
+          if policy_number and not conv.policy_number:
+            conv.policy_number = policy_number
+
           conv.last_message_at = now_utc()
           conv.updated_at = now_utc()
 
@@ -854,48 +859,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
           try:
             if (msg.get("type") == "text") and (text_body or "").strip():
               user_clean = (text_body or "").strip()
-
-
-
-              # --- Policy Details Flow Guard (do NOT persist policy_number on conversation) ---
-              # If we previously asked for policy number (after option 2), then when the next inbound message
-              # is a 6-20 digit number, treat it as the policy_number for details and trigger option-2 details.
-              # Also, if user says "details" after sending a policy number, reuse the last typed policy number.
-              user_for_reply = user_clean
-              try:
-                recent_msgs = db.execute(
-                  select(InboxMessage)
-                  .where(InboxMessage.conversation_id == conv.id)
-                  .order_by(desc(InboxMessage.created_at))
-                  .limit(10)
-                ).scalars().all()
-
-                last_out = next((m.body for m in recent_msgs if getattr(m, "direction", None) == "OUT" and (m.body or "").strip()), "")
-                last_in_policy = next(
-                  (
-                    (m.body or "").strip()
-                    for m in recent_msgs
-                    if getattr(m, "direction", None) == "IN"
-                    and re.fullmatch(r"\d{6,20}", (m.body or "").strip() or "")
-                  ),
-                  ""
-                )
-
-                asked_for_policy = bool(re.search(r"share your policy number|policy number \(6–20 digits\)|policy number \(6-20 digits\)", last_out or "", flags=re.I))
-                wants_details = user_for_reply in {"details", "detail", "policy details", "policy detail"}
-
-                # If user typed digits right after we asked for policy number, force option 2 details.
-                if asked_for_policy and re.fullmatch(r"\d{6,20}", user_for_reply or ""):
-                  policy_number = user_for_reply
-                  user_for_reply = "2"
-
-                # If user typed "details" and we have a last typed policy number, use it.
-                if wants_details and (not policy_number) and last_in_policy:
-                  policy_number = last_in_policy
-                  user_for_reply = "2"
-
-              except Exception:
-                user_for_reply = user_clean
 
               # Human handoff: if user asks for an agent/human, mark conversation PENDING and notify
               if re.search(r"(agent|human|representative|advisor|support|call me|callback|talk to|speak to)", user_clean, flags=re.I):
@@ -942,7 +905,7 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                 reply = openai_generate_reply(
                 customer_phone=customer_phone,
                 customer_name=customer_name,
-                user_text=user_for_reply,
+                user_text=(text_body or "").strip(),
                 policy_number=policy_number,
                 db=db,
               )
@@ -1599,9 +1562,11 @@ class PremiumReminderRunResponse(BaseModel):
 
 @app.post("/admin/reminders/run", response_model=PremiumReminderRunResponse)
 def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: Session = Depends(get_db)):
-  days_ahead = max(0, min(int(days_ahead), 60))
+  # Support negative windows as well (e.g., -3 to include past-due reminders).
+  days_ahead = max(-60, min(int(days_ahead), 60))
   today = now_utc().date()
-  end = today + timedelta(days=days_ahead)
+  start = today + timedelta(days=min(0, days_ahead))
+  end = today + timedelta(days=max(0, days_ahead))
 
   rows = db.execute(
     select(PremiumSchedule, Policy, Customer)
@@ -1609,7 +1574,7 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
     .join(Customer, Policy.customer_id == Customer.id)
     .where(
       PremiumSchedule.is_paid == False,
-      PremiumSchedule.due_date >= today,
+      PremiumSchedule.due_date >= start,
       PremiumSchedule.due_date <= end,
     )
     .order_by(asc(PremiumSchedule.due_date))
