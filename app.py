@@ -1568,7 +1568,8 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
   start = today + timedelta(days=min(0, days_ahead))
   end = today + timedelta(days=max(0, days_ahead))
 
-  rows = db.execute(
+  # Primary source: unpaid PremiumSchedule rows.
+  sched_rows = db.execute(
     select(PremiumSchedule, Policy, Customer)
     .join(Policy, PremiumSchedule.policy_id == Policy.id)
     .join(Customer, Policy.customer_id == Customer.id)
@@ -1580,11 +1581,53 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
     .order_by(asc(PremiumSchedule.due_date))
   ).all()
 
-  scanned = len(rows)
+  # Fallback source: Policy.next_premium_due_date.
+  # This is important because your "Policies Upload" flow stores the due date on Policy
+  # and does NOT create PremiumSchedule rows.
+  policy_ids_with_schedule = {pol.id for (_ps, pol, _cust) in sched_rows}
+  policy_rows = db.execute(
+    select(Policy, Customer)
+    .join(Customer, Policy.customer_id == Customer.id)
+    .where(
+      Policy.next_premium_due_date != None,
+      Policy.next_premium_due_date >= start,
+      Policy.next_premium_due_date <= end,
+      (~Policy.id.in_(policy_ids_with_schedule)) if policy_ids_with_schedule else True,
+    )
+    .order_by(asc(Policy.next_premium_due_date))
+  ).all()
+
+  # Normalize into a single candidate list so the rest of the logic stays identical.
+  candidates: list[dict] = []
+  for ps, pol, cust in sched_rows:
+    candidates.append({
+      "source": "schedule",
+      "ps": ps,
+      "policy": pol,
+      "customer": cust,
+      "due_date": ps.due_date,
+      "amount": float(ps.amount) if ps.amount is not None else (float(pol.premium_amount) if pol.premium_amount is not None else None),
+    })
+  for pol, cust in policy_rows:
+    candidates.append({
+      "source": "policy",
+      "ps": None,
+      "policy": pol,
+      "customer": cust,
+      "due_date": pol.next_premium_due_date,
+      "amount": float(pol.premium_amount) if pol.premium_amount is not None else None,
+    })
+
+  scanned = len(candidates)
   sent = skipped = errors = 0
   details: list[dict] = []
 
-  for ps, pol, cust in rows:
+  for item in candidates:
+    ps: PremiumSchedule | None = item["ps"]
+    pol: Policy = item["policy"]
+    cust: Customer = item["customer"]
+    due_date: date | None = item["due_date"]
+    amount: float | None = item["amount"]
     try:
       phone = (cust.phone_e164 or "").strip()
       if not phone:
@@ -1594,15 +1637,15 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
 
       customer_phone = phone if phone.startswith("+") else f"+{phone}"
 
-      if _already_reminded_today(db, policy_number=pol.policy_number, due_date=ps.due_date, customer_phone=customer_phone):
+      if _already_reminded_today(db, policy_number=pol.policy_number, due_date=due_date, customer_phone=customer_phone):
         skipped += 1
         details.append({"policy_number": pol.policy_number, "status": "SKIP", "reason": "ALREADY_SENT_TODAY"})
         continue
 
       msg = _premium_reminder_message(
         policy_number=pol.policy_number,
-        due_date=ps.due_date,
-        amount=float(ps.amount) if ps.amount is not None else (float(pol.premium_amount) if pol.premium_amount is not None else None),
+        due_date=due_date,
+        amount=amount,
       )
 
       if not dry_run:
@@ -1614,10 +1657,10 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
       conv.updated_at = now_utc()
       db.commit()
 
-      audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=pol.policy_number, customer_phone=customer_phone, success=True, reason=f"DUE:{ps.due_date.isoformat() if ps.due_date else 'NA'}")
+      audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=pol.policy_number, customer_phone=customer_phone, success=True, reason=f"SRC:{item['source']} DUE:{due_date.isoformat() if due_date else 'NA'}")
 
       sent += 1
-      details.append({"policy_number": pol.policy_number, "status": "SENT", "phone": customer_phone, "due_date": ps.due_date.isoformat()})
+      details.append({"policy_number": pol.policy_number, "status": "SENT", "phone": customer_phone, "due_date": (due_date.isoformat() if due_date else None), "source": item["source"]})
     except Exception as e:
       errors += 1
       details.append({"policy_number": getattr(pol, "policy_number", None), "status": "ERROR", "reason": str(e)[:200]})
