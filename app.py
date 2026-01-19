@@ -22,6 +22,7 @@ from sqlalchemy import (
   DateTime,
   Boolean,
   Numeric,
+  case,
   ForeignKey,
   Text,
   select,
@@ -1769,6 +1770,66 @@ async def admin_broadcast_premium_excel(file: UploadFile = File(...), dry_run: b
 
 
 # =========================================================
+# Reports
+# =========================================================
+
+@app.get("/admin/reports/contacts.xlsx")
+def admin_contacts_report(db: Session = Depends(get_db)):
+  """Download an Excel report of unique customer phone numbers who contacted the bot.
+
+  Columns:
+    - phone
+    - name
+    - last_contacted_at (IST)
+    - inbound_message_count
+  """
+  if openpyxl is None:
+    raise HTTPException(status_code=500, detail="openpyxl is not installed")
+
+  # Aggregate by phone across all conversations
+  rows = db.execute(
+    select(
+      InboxConversation.customer_phone.label("phone"),
+      func.max(InboxConversation.customer_name).label("name"),
+      func.max(InboxConversation.last_message_at).label("last_contacted"),
+      func.sum(case((InboxMessage.direction == "IN", 1), else_=0)).label("in_count"),
+    )
+    .select_from(InboxConversation)
+    .join(InboxMessage, InboxMessage.conversation_id == InboxConversation.id, isouter=True)
+    .where(InboxConversation.channel == "WHATSAPP")
+    .group_by(InboxConversation.customer_phone)
+    .order_by(desc(func.max(InboxConversation.last_message_at)))
+  ).all()
+
+  wb = openpyxl.Workbook()
+  ws = wb.active
+  ws.title = "Contacts"
+  ws.append(["phone", "name", "last_contacted_at_IST", "inbound_message_count"])
+
+  for r in rows:
+    phone = getattr(r, "phone", None)
+    name = getattr(r, "name", None)
+    last_contacted = getattr(r, "last_contacted", None)
+    in_count = getattr(r, "in_count", 0) or 0
+    # last_contacted is already stored in IST via now_utc() override, but keep label explicit.
+    last_contacted_s = last_contacted.isoformat(sep=" ") if isinstance(last_contacted, datetime) else ""
+    ws.append([phone or "", name or "", last_contacted_s, int(in_count)])
+
+  bio = BytesIO()
+  wb.save(bio)
+  bio.seek(0)
+
+  from fastapi.responses import StreamingResponse
+  headers = {"Content-Disposition": "attachment; filename=contacts_report.xlsx"}
+  return StreamingResponse(
+    bio,
+    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    headers=headers,
+  )
+
+
+
+# =========================================================
 # Dashboard (single-file HTML + CSS + JS)
 # =========================================================
 
@@ -2149,7 +2210,14 @@ DASHBOARD_HTML = r"""
          <button class="btn btnGhost" onclick="sendExcelReminders()">Send Excel Reminders</button>
         </div>
        </div>
-       <div class="hint" id="rem_out" style="margin-top:10px;">Ready.</div>
+      <div class="hint" id="rem_out" style="margin-top:10px;">Ready.</div>
+      <div class="row" style="margin-top:10px; align-items:flex-end;">
+       <div class="field" style="flex:0 0 auto;">
+        <label>Contacts report</label>
+        <button class="btn btnGhost" onclick="downloadContactsReport()">Download Contacts Report (Excel)</button>
+       </div>
+       <div class="hint" style="margin:0; opacity:.85;">Exports unique phone numbers, last contacted date, and message count.</div>
+      </div>
       </div>
      </div>
      
@@ -2652,6 +2720,11 @@ DASHBOARD_HTML = r"""
   }catch(e){
    out.innerHTML = "Network error: " + escapeHtml(String(e));
   }
+ }
+
+ function downloadContactsReport(){
+  // Triggers an Excel download of unique customer phones ordered by last contact
+  window.location.href = "/admin/reports/contacts.xlsx";
  }
 
   async function refreshAll(){
