@@ -15,10 +15,15 @@ WORKDIR /app
 
 # ---- Install Python deps first (better caching) ----
 COPY requirements.txt /app/requirements.txt
+COPY "nath investment.jpeg" .
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ---- Copy app code ----
 COPY app.py /app/app.py
+
+#-------copy image--------
+
+COPY "nath investment.jpeg" /app/"nath investment.jpeg"
 
 # ---- Expose port ----
 EXPOSE 8000
