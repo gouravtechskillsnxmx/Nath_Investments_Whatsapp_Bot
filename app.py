@@ -131,7 +131,7 @@ def whatsapp_upload_media(*, file_path: str, mime_type: str = "image/jpeg") -> s
   # Graph API expects multipart form-data
   with open(file_path, "rb") as f:
     files = {"file": (os.path.basename(file_path), f, mime_type)}
-    data = {"messaging_product": "whatsapp", "type": "image"}
+    data = {"messaging_product": "whatsapp", "type": mime_type}
     r = requests.post(url, headers=headers, files=files, data=data, timeout=45)
 
   if r.status_code >= 400:
