@@ -65,7 +65,7 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v17.0")
 
 # Welcome image (sent only once per customer on their first bot reply)
-WHATSAPP_WELCOME_IMAGE_PATH = os.getenv("WHATSAPP_WELCOME_IMAGE_PATH", "nath investment.jpeg")
+WHATSAPP_WELCOME_IMAGE_PATH = os.getenv("WHATSAPP_WELCOME_IMAGE_PATH", "nathinvestment.jpeg")
 WHATSAPP_WELCOME_IMAGE_CAPTION = os.getenv("WHATSAPP_WELCOME_IMAGE_CAPTION", "")
 
 # OpenAI (optional auto-replies)

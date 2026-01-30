@@ -22,7 +22,7 @@ COPY app.py /app/app.py
 
 #-------copy image--------
 
-COPY "nath investment.jpeg".
+COPY nathinvestment.jpeg /app/nathinvestment.jpeg
 
 # ---- Expose port ----
 EXPOSE 8000
