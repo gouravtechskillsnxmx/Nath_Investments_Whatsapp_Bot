@@ -22,7 +22,6 @@ from sqlalchemy import (
   DateTime,
   Boolean,
   Numeric,
-  case,
   ForeignKey,
   Text,
   select,
@@ -63,10 +62,6 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v17.0")
-
-# Welcome image (sent only once per customer on their first bot reply)
-WHATSAPP_WELCOME_IMAGE_PATH = os.getenv("WHATSAPP_WELCOME_IMAGE_PATH", "nath investment.jpeg")
-WHATSAPP_WELCOME_IMAGE_CAPTION = os.getenv("WHATSAPP_WELCOME_IMAGE_CAPTION", "")
 
 # OpenAI (optional auto-replies)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -118,136 +113,6 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
   if r.status_code >= 400:
     raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
   return r.json()
-
-
-def whatsapp_upload_media(*, file_path: str, mime_type: str = "image/jpeg") -> str:
-  """Upload media to WhatsApp Cloud API and return media_id."""
-  if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-    raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
-
-  url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/media"
-  headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
-
-  # Graph API expects multipart form-data
-  with open(file_path, "rb") as f:
-    files = {"file": (os.path.basename(file_path), f, mime_type)}
-    data = {"messaging_product": "whatsapp", "type": "image"}
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=45)
-
-  if r.status_code >= 400:
-    raise RuntimeError(f"WhatsApp media upload failed: {r.status_code} {r.text}")
-
-  j = r.json() if hasattr(r, "json") else {}
-  media_id = (j or {}).get("id")
-  if not media_id:
-    raise RuntimeError(f"WhatsApp media upload missing id: {j}")
-  return media_id
-
-
-def send_whatsapp_image(to_number: str, *, image_path: str, caption: str | None = None) -> dict:
-  """Send an image message to WhatsApp. Uploads the image and sends using returned media id."""
-  if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-    raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
-
-  if not image_path:
-    raise RuntimeError("Missing image_path")
-  if not os.path.exists(image_path):
-    raise RuntimeError(f"Welcome image file not found: {image_path}")
-
-  # Best-effort MIME type based on extension
-  ext = os.path.splitext(image_path.lower())[1]
-  mime = "image/png" if ext == ".png" else ("image/webp" if ext == ".webp" else "image/jpeg")
-
-  media_id = whatsapp_upload_media(file_path=image_path, mime_type=mime)
-
-  url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-  headers = {
-    "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-    "Content-Type": "application/json",
-  }
-  payload = {
-    "messaging_product": "whatsapp",
-    "to": to_number,
-    "type": "image",
-    "image": {"id": media_id},
-  }
-  if caption:
-    payload["image"]["caption"] = caption
-
-  r = requests.post(url, headers=headers, json=payload, timeout=30)
-  if r.status_code >= 400:
-    raise RuntimeError(f"WhatsApp image send failed: {r.status_code} {r.text}")
-  return r.json()
-
-
-def _welcome_image_already_sent(db: Session, *, customer_phone: str) -> bool:
-  """True if we've already sent the welcome image to this customer phone."""
-  row = db.execute(
-    select(AuditLog)
-    .where(
-      AuditLog.action == "WELCOME_IMAGE",
-      AuditLog.customer_phone == customer_phone,
-      AuditLog.success == True, # noqa: E712
-    )
-    .order_by(desc(AuditLog.created_at))
-    .limit(1)
-  ).scalars().first()
-  return bool(row)
-
-
-def _send_welcome_image_once(db: Session, *, customer_phone: str, conv_id: str | None = None):
-  """Send welcome image to customer only once. Never raises."""
-  try:
-    if _welcome_image_already_sent(db, customer_phone=customer_phone):
-      return
-
-    caption = (WHATSAPP_WELCOME_IMAGE_CAPTION or "").strip() or None
-    # Try both direct path and local dir relative path
-    img_path = WHATSAPP_WELCOME_IMAGE_PATH
-    if img_path and not os.path.isabs(img_path):
-      # if relative, resolve from current working directory
-      img_path = os.path.join(os.getcwd(), img_path)
-
-    send_whatsapp_image(customer_phone, image_path=img_path, caption=caption)
-
-    # Store a marker in inbox thread (optional; keeps history)
-    if conv_id:
-      db.add(
-        InboxMessage(
-          conversation_id=conv_id,
-          direction="OUT",
-          body="[WELCOME_IMAGE]",
-          actor_user_id=None,
-          created_at=now_utc(),
-        )
-      )
-
-    audit(
-      db,
-      channel="WHATSAPP",
-      request_id=None,
-      action="WELCOME_IMAGE",
-      policy_number=None,
-      customer_phone=customer_phone,
-      success=True,
-      reason=f"FILE:{WHATSAPP_WELCOME_IMAGE_PATH}",
-    )
-    db.commit()
-  except Exception as e:
-    try:
-      audit(
-        db,
-        channel="WHATSAPP",
-        request_id=None,
-        action="WELCOME_IMAGE",
-        policy_number=None,
-        customer_phone=customer_phone,
-        success=False,
-        reason=str(e)[:250],
-      )
-      db.commit()
-    except Exception:
-      pass
 
 
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
@@ -1003,9 +868,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                   conv.last_message_at = now_utc()
                   handoff_msg = "Sure — I’m connecting you to a human advisor at Nath Investments. An agent will reply shortly."
 
-                  # Send welcome image on first-time reply (non-destructive)
-                  _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
-
                   # Deliver to WhatsApp
                   send_whatsapp_text(customer_phone, handoff_msg)
 
@@ -1048,9 +910,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                 db=db,
               )
               if reply:
-                # Send welcome image on first-time reply (non-destructive)
-                _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
-
                 # Deliver to WhatsApp
                 send_whatsapp_text(customer_phone, reply)
 
@@ -1703,72 +1562,27 @@ class PremiumReminderRunResponse(BaseModel):
 
 @app.post("/admin/reminders/run", response_model=PremiumReminderRunResponse)
 def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: Session = Depends(get_db)):
-  # Support negative windows as well (e.g., -3 to include past-due reminders).
-  days_ahead = max(-60, min(int(days_ahead), 60))
+  days_ahead = max(0, min(int(days_ahead), 60))
   today = now_utc().date()
-  start = today + timedelta(days=min(0, days_ahead))
-  end = today + timedelta(days=max(0, days_ahead))
+  end = today + timedelta(days=days_ahead)
 
-  # Primary source: unpaid PremiumSchedule rows.
-  sched_rows = db.execute(
+  rows = db.execute(
     select(PremiumSchedule, Policy, Customer)
     .join(Policy, PremiumSchedule.policy_id == Policy.id)
     .join(Customer, Policy.customer_id == Customer.id)
     .where(
       PremiumSchedule.is_paid == False,
-      PremiumSchedule.due_date >= start,
+      PremiumSchedule.due_date >= today,
       PremiumSchedule.due_date <= end,
     )
     .order_by(asc(PremiumSchedule.due_date))
   ).all()
 
-  # Fallback source: Policy.next_premium_due_date.
-  # This is important because your "Policies Upload" flow stores the due date on Policy
-  # and does NOT create PremiumSchedule rows.
-  policy_ids_with_schedule = {pol.id for (_ps, pol, _cust) in sched_rows}
-  policy_rows = db.execute(
-    select(Policy, Customer)
-    .join(Customer, Policy.customer_id == Customer.id)
-    .where(
-      Policy.next_premium_due_date != None,
-      Policy.next_premium_due_date >= start,
-      Policy.next_premium_due_date <= end,
-      (~Policy.id.in_(policy_ids_with_schedule)) if policy_ids_with_schedule else True,
-    )
-    .order_by(asc(Policy.next_premium_due_date))
-  ).all()
-
-  # Normalize into a single candidate list so the rest of the logic stays identical.
-  candidates: list[dict] = []
-  for ps, pol, cust in sched_rows:
-    candidates.append({
-      "source": "schedule",
-      "ps": ps,
-      "policy": pol,
-      "customer": cust,
-      "due_date": ps.due_date,
-      "amount": float(ps.amount) if ps.amount is not None else (float(pol.premium_amount) if pol.premium_amount is not None else None),
-    })
-  for pol, cust in policy_rows:
-    candidates.append({
-      "source": "policy",
-      "ps": None,
-      "policy": pol,
-      "customer": cust,
-      "due_date": pol.next_premium_due_date,
-      "amount": float(pol.premium_amount) if pol.premium_amount is not None else None,
-    })
-
-  scanned = len(candidates)
+  scanned = len(rows)
   sent = skipped = errors = 0
   details: list[dict] = []
 
-  for item in candidates:
-    ps: PremiumSchedule | None = item["ps"]
-    pol: Policy = item["policy"]
-    cust: Customer = item["customer"]
-    due_date: date | None = item["due_date"]
-    amount: float | None = item["amount"]
+  for ps, pol, cust in rows:
     try:
       phone = (cust.phone_e164 or "").strip()
       if not phone:
@@ -1778,15 +1592,15 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
 
       customer_phone = phone if phone.startswith("+") else f"+{phone}"
 
-      if _already_reminded_today(db, policy_number=pol.policy_number, due_date=due_date, customer_phone=customer_phone):
+      if _already_reminded_today(db, policy_number=pol.policy_number, due_date=ps.due_date, customer_phone=customer_phone):
         skipped += 1
         details.append({"policy_number": pol.policy_number, "status": "SKIP", "reason": "ALREADY_SENT_TODAY"})
         continue
 
       msg = _premium_reminder_message(
         policy_number=pol.policy_number,
-        due_date=due_date,
-        amount=amount,
+        due_date=ps.due_date,
+        amount=float(ps.amount) if ps.amount is not None else (float(pol.premium_amount) if pol.premium_amount is not None else None),
       )
 
       if not dry_run:
@@ -1798,10 +1612,10 @@ def admin_run_premium_reminders(days_ahead: int = 3, dry_run: bool = False, db: 
       conv.updated_at = now_utc()
       db.commit()
 
-      audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=pol.policy_number, customer_phone=customer_phone, success=True, reason=f"SRC:{item['source']} DUE:{due_date.isoformat() if due_date else 'NA'}")
+      audit(db, channel="WHATSAPP", request_id=None, action="PREMIUM_REMINDER", policy_number=pol.policy_number, customer_phone=customer_phone, success=True, reason=f"DUE:{ps.due_date.isoformat() if ps.due_date else 'NA'}")
 
       sent += 1
-      details.append({"policy_number": pol.policy_number, "status": "SENT", "phone": customer_phone, "due_date": (due_date.isoformat() if due_date else None), "source": item["source"]})
+      details.append({"policy_number": pol.policy_number, "status": "SENT", "phone": customer_phone, "due_date": ps.due_date.isoformat()})
     except Exception as e:
       errors += 1
       details.append({"policy_number": getattr(pol, "policy_number", None), "status": "ERROR", "reason": str(e)[:200]})
@@ -1906,66 +1720,6 @@ async def admin_broadcast_premium_excel(file: UploadFile = File(...), dry_run: b
         pass
 
   return {"ok": True, "sent": sent, "skipped": skipped, "errors": errors, "details": details}
-
-
-
-# =========================================================
-# Reports
-# =========================================================
-
-@app.get("/admin/reports/contacts.xlsx")
-def admin_contacts_report(db: Session = Depends(get_db)):
-  """Download an Excel report of unique customer phone numbers who contacted the bot.
-
-  Columns:
-    - phone
-    - name
-    - last_contacted_at (IST)
-    - inbound_message_count
-  """
-  if openpyxl is None:
-    raise HTTPException(status_code=500, detail="openpyxl is not installed")
-
-  # Aggregate by phone across all conversations
-  rows = db.execute(
-    select(
-      InboxConversation.customer_phone.label("phone"),
-      func.max(InboxConversation.customer_name).label("name"),
-      func.max(InboxConversation.last_message_at).label("last_contacted"),
-      func.sum(case((InboxMessage.direction == "IN", 1), else_=0)).label("in_count"),
-    )
-    .select_from(InboxConversation)
-    .join(InboxMessage, InboxMessage.conversation_id == InboxConversation.id, isouter=True)
-    .where(InboxConversation.channel == "WHATSAPP")
-    .group_by(InboxConversation.customer_phone)
-    .order_by(desc(func.max(InboxConversation.last_message_at)))
-  ).all()
-
-  wb = openpyxl.Workbook()
-  ws = wb.active
-  ws.title = "Contacts"
-  ws.append(["phone", "name", "last_contacted_at_IST", "inbound_message_count"])
-
-  for r in rows:
-    phone = getattr(r, "phone", None)
-    name = getattr(r, "name", None)
-    last_contacted = getattr(r, "last_contacted", None)
-    in_count = getattr(r, "in_count", 0) or 0
-    # last_contacted is already stored in IST via now_utc() override, but keep label explicit.
-    last_contacted_s = last_contacted.isoformat(sep=" ") if isinstance(last_contacted, datetime) else ""
-    ws.append([phone or "", name or "", last_contacted_s, int(in_count)])
-
-  bio = BytesIO()
-  wb.save(bio)
-  bio.seek(0)
-
-  from fastapi.responses import StreamingResponse
-  headers = {"Content-Disposition": "attachment; filename=contacts_report.xlsx"}
-  return StreamingResponse(
-    bio,
-    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    headers=headers,
-  )
 
 
 
@@ -2350,14 +2104,7 @@ DASHBOARD_HTML = r"""
          <button class="btn btnGhost" onclick="sendExcelReminders()">Send Excel Reminders</button>
         </div>
        </div>
-      <div class="hint" id="rem_out" style="margin-top:10px;">Ready.</div>
-      <div class="row" style="margin-top:10px; align-items:flex-end;">
-       <div class="field" style="flex:0 0 auto;">
-        <label>Contacts report</label>
-        <button class="btn btnGhost" onclick="downloadContactsReport()">Download Contacts Report (Excel)</button>
-       </div>
-       <div class="hint" style="margin:0; opacity:.85;">Exports unique phone numbers, last contacted date, and message count.</div>
-      </div>
+       <div class="hint" id="rem_out" style="margin-top:10px;">Ready.</div>
       </div>
      </div>
      
@@ -2860,11 +2607,6 @@ DASHBOARD_HTML = r"""
   }catch(e){
    out.innerHTML = "Network error: " + escapeHtml(String(e));
   }
- }
-
- function downloadContactsReport(){
-  // Triggers an Excel download of unique customer phones ordered by last contact
-  window.location.href = "/admin/reports/contacts.xlsx";
  }
 
   async function refreshAll(){

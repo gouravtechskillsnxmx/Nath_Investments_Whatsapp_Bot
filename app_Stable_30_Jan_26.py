@@ -64,10 +64,6 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v17.0")
 
-# Welcome image (sent only once per customer on their first bot reply)
-WHATSAPP_WELCOME_IMAGE_PATH = os.getenv("WHATSAPP_WELCOME_IMAGE_PATH", "nath investment.jpeg")
-WHATSAPP_WELCOME_IMAGE_CAPTION = os.getenv("WHATSAPP_WELCOME_IMAGE_CAPTION", "")
-
 # OpenAI (optional auto-replies)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -118,136 +114,6 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
   if r.status_code >= 400:
     raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
   return r.json()
-
-
-def whatsapp_upload_media(*, file_path: str, mime_type: str = "image/jpeg") -> str:
-  """Upload media to WhatsApp Cloud API and return media_id."""
-  if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-    raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
-
-  url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/media"
-  headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
-
-  # Graph API expects multipart form-data
-  with open(file_path, "rb") as f:
-    files = {"file": (os.path.basename(file_path), f, mime_type)}
-    data = {"messaging_product": "whatsapp", "type": "image"}
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=45)
-
-  if r.status_code >= 400:
-    raise RuntimeError(f"WhatsApp media upload failed: {r.status_code} {r.text}")
-
-  j = r.json() if hasattr(r, "json") else {}
-  media_id = (j or {}).get("id")
-  if not media_id:
-    raise RuntimeError(f"WhatsApp media upload missing id: {j}")
-  return media_id
-
-
-def send_whatsapp_image(to_number: str, *, image_path: str, caption: str | None = None) -> dict:
-  """Send an image message to WhatsApp. Uploads the image and sends using returned media id."""
-  if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-    raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
-
-  if not image_path:
-    raise RuntimeError("Missing image_path")
-  if not os.path.exists(image_path):
-    raise RuntimeError(f"Welcome image file not found: {image_path}")
-
-  # Best-effort MIME type based on extension
-  ext = os.path.splitext(image_path.lower())[1]
-  mime = "image/png" if ext == ".png" else ("image/webp" if ext == ".webp" else "image/jpeg")
-
-  media_id = whatsapp_upload_media(file_path=image_path, mime_type=mime)
-
-  url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-  headers = {
-    "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-    "Content-Type": "application/json",
-  }
-  payload = {
-    "messaging_product": "whatsapp",
-    "to": to_number,
-    "type": "image",
-    "image": {"id": media_id},
-  }
-  if caption:
-    payload["image"]["caption"] = caption
-
-  r = requests.post(url, headers=headers, json=payload, timeout=30)
-  if r.status_code >= 400:
-    raise RuntimeError(f"WhatsApp image send failed: {r.status_code} {r.text}")
-  return r.json()
-
-
-def _welcome_image_already_sent(db: Session, *, customer_phone: str) -> bool:
-  """True if we've already sent the welcome image to this customer phone."""
-  row = db.execute(
-    select(AuditLog)
-    .where(
-      AuditLog.action == "WELCOME_IMAGE",
-      AuditLog.customer_phone == customer_phone,
-      AuditLog.success == True, # noqa: E712
-    )
-    .order_by(desc(AuditLog.created_at))
-    .limit(1)
-  ).scalars().first()
-  return bool(row)
-
-
-def _send_welcome_image_once(db: Session, *, customer_phone: str, conv_id: str | None = None):
-  """Send welcome image to customer only once. Never raises."""
-  try:
-    if _welcome_image_already_sent(db, customer_phone=customer_phone):
-      return
-
-    caption = (WHATSAPP_WELCOME_IMAGE_CAPTION or "").strip() or None
-    # Try both direct path and local dir relative path
-    img_path = WHATSAPP_WELCOME_IMAGE_PATH
-    if img_path and not os.path.isabs(img_path):
-      # if relative, resolve from current working directory
-      img_path = os.path.join(os.getcwd(), img_path)
-
-    send_whatsapp_image(customer_phone, image_path=img_path, caption=caption)
-
-    # Store a marker in inbox thread (optional; keeps history)
-    if conv_id:
-      db.add(
-        InboxMessage(
-          conversation_id=conv_id,
-          direction="OUT",
-          body="[WELCOME_IMAGE]",
-          actor_user_id=None,
-          created_at=now_utc(),
-        )
-      )
-
-    audit(
-      db,
-      channel="WHATSAPP",
-      request_id=None,
-      action="WELCOME_IMAGE",
-      policy_number=None,
-      customer_phone=customer_phone,
-      success=True,
-      reason=f"FILE:{WHATSAPP_WELCOME_IMAGE_PATH}",
-    )
-    db.commit()
-  except Exception as e:
-    try:
-      audit(
-        db,
-        channel="WHATSAPP",
-        request_id=None,
-        action="WELCOME_IMAGE",
-        policy_number=None,
-        customer_phone=customer_phone,
-        success=False,
-        reason=str(e)[:250],
-      )
-      db.commit()
-    except Exception:
-      pass
 
 
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
@@ -1003,9 +869,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                   conv.last_message_at = now_utc()
                   handoff_msg = "Sure — I’m connecting you to a human advisor at Nath Investments. An agent will reply shortly."
 
-                  # Send welcome image on first-time reply (non-destructive)
-                  _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
-
                   # Deliver to WhatsApp
                   send_whatsapp_text(customer_phone, handoff_msg)
 
@@ -1048,9 +911,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                 db=db,
               )
               if reply:
-                # Send welcome image on first-time reply (non-destructive)
-                _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
-
                 # Deliver to WhatsApp
                 send_whatsapp_text(customer_phone, reply)
 
