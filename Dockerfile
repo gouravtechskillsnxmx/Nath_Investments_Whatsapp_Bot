@@ -15,7 +15,6 @@ WORKDIR /app
 
 # ---- Install Python deps first (better caching) ----
 COPY requirements.txt /app/requirements.txt
-COPY "nath investment.jpeg" .
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ---- Copy app code ----
