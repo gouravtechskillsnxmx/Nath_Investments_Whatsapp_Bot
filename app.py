@@ -250,6 +250,59 @@ def _send_welcome_image_once(db: Session, *, customer_phone: str, conv_id: str |
       pass
 
 
+
+def _send_welcome_image_every_greeting(db: Session, *, customer_phone: str, conv_id: str | None = None):
+  """
+  Send the welcome image whenever the user sends a greeting like 'hi'.
+  Best-effort: never raises.
+  """
+  try:
+    caption = (WHATSAPP_WELCOME_IMAGE_CAPTION or "").strip() or None
+    img_path = WHATSAPP_WELCOME_IMAGE_PATH
+    if img_path and not os.path.isabs(img_path):
+      img_path = os.path.join(os.getcwd(), img_path)
+
+    send_whatsapp_image(customer_phone, image_path=img_path, caption=caption)
+
+    if conv_id:
+      db.add(
+        InboxMessage(
+          conversation_id=conv_id,
+          direction="OUT",
+          body="[WELCOME_IMAGE]",
+          actor_user_id=None,
+          created_at=now_utc(),
+        )
+      )
+
+    audit(
+      db,
+      channel="WHATSAPP",
+      request_id=None,
+      action="WELCOME_IMAGE",
+      policy_number=None,
+      customer_phone=customer_phone,
+      success=True,
+      reason=f"GREETING FILE:{WHATSAPP_WELCOME_IMAGE_PATH}",
+    )
+    db.commit()
+  except Exception as e:
+    try:
+      audit(
+        db,
+        channel="WHATSAPP",
+        request_id=None,
+        action="WELCOME_IMAGE",
+        policy_number=None,
+        customer_phone=customer_phone,
+        success=False,
+        reason=str(e)[:250],
+      )
+      db.commit()
+    except Exception:
+      pass
+
+
 def openai_generate_reply(*, customer_phone: str, customer_name: str | None, user_text: str, policy_number: str | None, db: Session) -> str:
   """Generate a safe WhatsApp reply using OpenAI. Never invent policy facts; use DB lookup when possible."""
 
@@ -1004,7 +1057,11 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                   handoff_msg = "Sure — I’m connecting you to a human advisor at Nath Investments. An agent will reply shortly."
 
                   # Send welcome image on first-time reply (non-destructive)
-                  _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
+                  # Send welcome image on every greeting; otherwise only once
+                  if (user_clean or '').strip().lower() in {'hi','hello','hey','hii','hiii','good morning','good afternoon','good evening','namaste'}:
+                    _send_welcome_image_every_greeting(db, customer_phone=customer_phone, conv_id=conv.id)
+                  else:
+                    _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
 
                   # Deliver to WhatsApp
                   send_whatsapp_text(customer_phone, handoff_msg)
@@ -1049,7 +1106,11 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
               )
               if reply:
                 # Send welcome image on first-time reply (non-destructive)
-                _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
+                # Send welcome image on every greeting; otherwise only once
+                if (user_clean or '').strip().lower() in {'hi','hello','hey','hii','hiii','good morning','good afternoon','good evening','namaste'}:
+                  _send_welcome_image_every_greeting(db, customer_phone=customer_phone, conv_id=conv.id)
+                else:
+                  _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
 
                 # Deliver to WhatsApp
                 send_whatsapp_text(customer_phone, reply)
