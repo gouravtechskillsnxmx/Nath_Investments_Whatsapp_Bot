@@ -323,11 +323,23 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
     name = (customer_name or "").strip()
     prefix = f"Hi {name}, " if name else "Hi, "
     return (
-      f"{prefix}Nath Investment is a financial firm offering services in LIC and Mutual Funds.\n\n"
-      "✅ LIC Services: New policy guidance, premium due reminders, policy status help, revival support, maturity/claim assistance.\n"
-      "✅ Mutual Funds: SIP & lumpsum guidance, KYC support, portfolio review and general fund selection guidance (no guaranteed returns).\n\n"
-      "If you want, tell me what you’re looking for (LIC or Mutual Funds) and I’ll guide you."
-    )
+    f"{prefix}🟢 About Nath Investments & Our Services\n\n"
+    "Nath Investments® is an Insurance & Investment Consultancy with 25+ years of experience, "
+    "led by Shashi Nath Thakur (Life Time Advisor – MDRT, COT, TOT – USA).\n\n"
+    "🔹 We are experts in:\n\n"
+    "• Health Insurance\n"
+    "• Company Group Insurance\n"
+    "• Life Insurance\n"
+    "• Car Insurance\n"
+    "• Mutual Funds\n"
+    "• PMS / AIF / GIFT City Products\n"
+    "• Marine Insurance\n\n"
+    "🔹 What we do for you:\n\n"
+    "✔ Guidance on new policies & investments\n"
+    "✔ Review and support for existing policies\n"
+    "✔ Help with premium due, policy status & maturity\n"
+    "✔ Long-term planning towards a secure financial future"
+)
 
 
   if opt == "2":
