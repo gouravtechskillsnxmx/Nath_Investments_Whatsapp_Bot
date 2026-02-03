@@ -120,6 +120,59 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
   return r.json()
 
 
+def send_whatsapp_interactive_list(to_number: str, *, body_text: str, button_text: str, sections: list[dict]) -> dict:
+  """Send a WhatsApp interactive LIST message (Cloud API)."""
+  if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
+    raise RuntimeError("Missing WhatsApp env vars: WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID")
+
+  url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+  headers = {
+    "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+    "Content-Type": "application/json",
+  }
+  payload = {
+    "messaging_product": "whatsapp",
+    "to": to_number,
+    "type": "interactive",
+    "interactive": {
+      "type": "list",
+      "body": {"text": body_text},
+      "action": {"button": button_text, "sections": sections},
+    },
+  }
+
+  r = requests.post(url, headers=headers, json=payload, timeout=30)
+  if r.status_code >= 400:
+    raise RuntimeError(f"WhatsApp interactive send failed: {r.status_code} {r.text}")
+  return r.json()
+
+
+def send_whatsapp_main_menu_v2(to_number: str) -> dict:
+  """Main menu as WhatsApp LIST (supports up to 10 rows)."""
+  body_text = "Please choose an option 👇"
+  sections = [{
+    "title": "Nath Investment Menu",
+    "rows": [
+      {"id": "MENU_1", "title": "1) About Nath Investments", "description": "Our services & expertise"},
+      {"id": "MENU_2", "title": "2) Know your policy details", "description": "Policy status, due, maturity"},
+      {"id": "MENU_3", "title": "3) Premium due & reminders", "description": "Due date + reminders"},
+      {"id": "MENU_4", "title": "4) Policy maturity & benefits", "description": "Maturity date/amount guidance"},
+      {"id": "MENU_5", "title": "5) Claim process & documents", "description": "Maturity/death/health claims"},
+      {"id": "MENU_6", "title": "6) Insurance guidance", "description": "Life/Health/Car/Group"},
+      {"id": "MENU_7", "title": "7) Mutual Fund & SIP", "description": "SIP/Lumpsum/Review"},
+      {"id": "MENU_8", "title": "8) Policy & portfolio review", "description": "Review existing policies/investments"},
+      {"id": "MENU_9", "title": "9) Talk to human agent", "description": "Connect to advisor"},
+    ],
+  }]
+  return send_whatsapp_interactive_list(
+    to_number,
+    body_text=body_text,
+    button_text="Open Menu",
+    sections=sections,
+  )
+
+
+
 def whatsapp_upload_media(*, file_path: str, mime_type: str = "image/jpeg") -> str:
   """Upload media to WhatsApp Cloud API and return media_id."""
   if not (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
@@ -980,6 +1033,22 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
 
           if msg.get("type") == "text":
             text_body = msg.get("text", {}).get("body", "")
+          elif msg.get("type") == "interactive":
+            # Button/List replies come here. Map payload id -> menu option digit.
+            payload_id = None
+            try:
+              inter = msg.get("interactive") or {}
+              lr = inter.get("list_reply") or {}
+              br = inter.get("button_reply") or {}
+              payload_id = (lr.get("id") or br.get("id") or "").strip()
+            except Exception:
+              payload_id = None
+
+            mapping = {
+              "MENU_1": "1", "MENU_2": "2", "MENU_3": "3", "MENU_4": "4", "MENU_5": "5",
+              "MENU_6": "6", "MENU_7": "7", "MENU_8": "8", "MENU_9": "9",
+            }
+            text_body = mapping.get(payload_id, "[interactive]")
           else:
             text_body = f"[{msg.get('type', 'unknown')} message received]"
 
@@ -1073,6 +1142,27 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
           try:
             if (msg.get("type") == "text") and (text_body or "").strip():
               user_clean = (text_body or "").strip()
+
+              # V2 interactive menu: on greetings, send image + LIST menu and stop.
+              if user_clean.lower() in {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening", "namaste"}:
+                try:
+                  _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
+                except Exception:
+                  pass
+                try:
+                  send_whatsapp_main_menu_v2(customer_phone)
+                  db.add(InboxMessage(conversation_id=conv.id, direction="OUT", body="[MENU_INTERACTIVE]", actor_user_id=None, created_at=now_utc()))
+                  conv.last_message_at = now_utc()
+                  conv.updated_at = now_utc()
+                  audit(db, channel="WHATSAPP", request_id=None, action="AUTO_MENU_V2", policy_number=policy_number, customer_phone=customer_phone, success=True, reason=None)
+                  db.commit()
+                except Exception as _merr:
+                  try:
+                    audit(db, channel="WHATSAPP", request_id=None, action="AUTO_MENU_V2", policy_number=policy_number, customer_phone=customer_phone, success=False, reason=str(_merr)[:250])
+                    db.commit()
+                  except Exception:
+                    pass
+                return {"ok": True, "handled": handled}
 
               # Human handoff: if user asks for an agent/human, mark conversation PENDING and notify
               if re.search(r"(agent|human|representative|advisor|support|call me|callback|talk to|speak to)", user_clean, flags=re.I):
