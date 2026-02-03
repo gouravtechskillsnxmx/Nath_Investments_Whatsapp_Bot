@@ -489,63 +489,44 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
   # ADD: option 4 - Policy maturity & benefits (general guidance)
   if opt == "4":
     return (
-      "✅ *Policy Maturity & Benefits*
-
-"
-      "Please share your *policy number* to check maturity date, expected amount (if available), and any pending actions.
-"
+      "✅ *Policy Maturity & Benefits*\n\n"
+      "Please share your *policy number* to check maturity date, expected amount (if available), and any pending actions.\n"
       "If you don’t have the number, share your *full name + registered mobile* and we will guide you."
     )
 
   # ADD: option 5 - Claim process & documents (general checklist)
   if opt == "5":
     return (
-      "✅ *Claim Process & Documents*
-
-"
-      "Tell me the claim type: *Maturity / Death / Accident / Health / Motor*.
-"
-      "Common documents: ID proof, policy copy, premium receipts, bank details, and claim form.
-"
+      "✅ *Claim Process & Documents*\n\n"
+      "Tell me the claim type: *Maturity / Death / Accident / Health / Motor*.\n"
+      "Common documents: ID proof, policy copy, premium receipts, bank details, and claim form.\n"
       "For exact steps, share your *policy number* or reply *9* for a human agent."
     )
 
   # ADD: option 6 - Insurance guidance
   if opt == "6":
     return (
-      "✅ *Insurance Guidance (Health / Life / Car / Group)*
-
-"
-      "Tell me:
-"
-      "1) Insurance type (Health/Life/Car/Group)
-"
-      "2) Age(s) & city
-"
-      "3) Coverage needed / budget
-"
+      "✅ *Insurance Guidance (Health / Life / Car / Group)*\n\n"
+      "Tell me:\n"
+      "1) Insurance type (Health/Life/Car/Group)\n"
+      "2) Age(s) & city\n"
+      "3) Coverage needed / budget\n"
       "I’ll suggest the right direction (no guarantees) and can connect you to an advisor if needed."
     )
 
   # ADD: option 7 - Mutual Fund & SIP guidance (educational)
   if opt == "7":
     return (
-      "✅ *Mutual Fund & SIP Guidance*
-
-"
-      "Tell me your goal (wealth/child/retirement), time horizon, and monthly SIP amount.
-"
+      "✅ *Mutual Fund & SIP Guidance*\n\n"
+      "Tell me your goal (wealth/child/retirement), time horizon, and monthly SIP amount.\n"
       "I’ll guide you on SIP basics, risk profile, and KYC steps. (Returns are not guaranteed.)"
     )
 
   # ADD: option 8 - Existing policy review & portfolio help
   if opt == "8":
     return (
-      "✅ *Existing Policy Review & Portfolio Help*
-
-"
-      "Share your existing policy numbers / fund names (or upload details via our dashboard).
-"
+      "✅ *Existing Policy Review & Portfolio Help*\n\n"
+      "Share your existing policy numbers / fund names (or upload details via our dashboard).\n"
       "We can help you understand premium due, maturity planning, and overall portfolio review."
     )
 
