@@ -547,46 +547,6 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
     return "\n".join(lines)
 
-  if opt == "3":
-    # Premium due & reminders (menu option 3)
-    if not policy_number:
-      return (
-        "🔔 *Premium Due & Reminders*\n\n"
-        "Please share your policy number (6–20 digits) so I can check your next premium due date and premium amount."
-      )
-
-    policy = db.execute(select(Policy).where(Policy.policy_number == policy_number)).scalars().first()
-    if not policy:
-      return f"Sorry, no policy found for this policy number: {policy_number}."
-
-    next_due_date = getattr(policy, "next_premium_due_date", None)
-    premium_amt = getattr(policy, "premium_amount", None)
-    grace = getattr(policy, "grace_period_days", None)
-
-    def _fmt(d):
-      try:
-        if not d:
-          return "Not available"
-        if hasattr(d, "date") and hasattr(d, "hour"):
-          d = d.date()
-        return d.strftime("%d-%b-%Y")
-      except Exception:
-        return str(d) if d else "Not available"
-
-    lines = [
-      "🔔 *Premium Due & Reminders*",
-      f"Policy No: *{policy.policy_number}*",
-      f"Next Premium Due Date: *{_fmt(next_due_date)}*",
-      f"Premium Amount: *₹{float(premium_amt):,.2f}*" if premium_amt is not None else "Premium Amount: *Not available*",
-      f"Grace Period (days): *{grace}*" if grace is not None else "Grace Period (days): *Not available*",
-      "",
-      "If you want an agent callback, reply *9* (Talk to our human agent).",
-    ]
-    return "\n".join(lines)
-
-
-
-
 
   if opt == "3":
 
