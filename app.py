@@ -312,14 +312,11 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
   # Deterministic menu routing for option selections (1/2/3)
   # Normalize common inputs like "1", "1.", "press 1", "option 1"
   opt = None
-  m_opt = re.search(r"\b([123])\b", txt)
+  m_opt = re.search(r"\b([1-9])\b", txt)
   if m_opt and txt in {m_opt.group(1), f"{m_opt.group(1)}.", f"press {m_opt.group(1)}", f"option {m_opt.group(1)}"}:
     opt = m_opt.group(1)
   # Also accept single-character inputs with whitespace
   if txt in {"1", "2", "3"}:
-    opt = txt
-  # ADD: accept menu options 4-9 as well
-  if txt in {"4","5","6","7","8","9"}:
     opt = txt
 
   if opt == "1":
@@ -483,56 +480,16 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
   if opt == "3":
 
-    # Human handoff phrase; existing handoff logic in webhook can also detect keywords.
-    return "Sure — connecting you to a human advisor now. Please wait, our team will reply shortly."
-
-  # ADD: option 4 - Policy maturity & benefits (general guidance)
-  if opt == "4":
+    # Premium due & reminders
     return (
-      "✅ *Policy Maturity & Benefits*\n\n"
-      "Please share your *policy number* to check maturity date, expected amount (if available), and any pending actions.\n"
-      "If you don’t have the number, share your *full name + registered mobile* and we will guide you."
+      "🔔 *Premium Due & Reminders*\n\n"
+      "I can help you with:\n"
+      "• Next premium due date\n"
+      "• Premium reminders\n"
+      "• Avoid policy lapse\n\n"
+      "Please share your policy number to continue."
     )
 
-  # ADD: option 5 - Claim process & documents (general checklist)
-  if opt == "5":
-    return (
-      "✅ *Claim Process & Documents*\n\n"
-      "Tell me the claim type: *Maturity / Death / Accident / Health / Motor*.\n"
-      "Common documents: ID proof, policy copy, premium receipts, bank details, and claim form.\n"
-      "For exact steps, share your *policy number* or reply *9* for a human agent."
-    )
-
-  # ADD: option 6 - Insurance guidance
-  if opt == "6":
-    return (
-      "✅ *Insurance Guidance (Health / Life / Car / Group)*\n\n"
-      "Tell me:\n"
-      "1) Insurance type (Health/Life/Car/Group)\n"
-      "2) Age(s) & city\n"
-      "3) Coverage needed / budget\n"
-      "I’ll suggest the right direction (no guarantees) and can connect you to an advisor if needed."
-    )
-
-  # ADD: option 7 - Mutual Fund & SIP guidance (educational)
-  if opt == "7":
-    return (
-      "✅ *Mutual Fund & SIP Guidance*\n\n"
-      "Tell me your goal (wealth/child/retirement), time horizon, and monthly SIP amount.\n"
-      "I’ll guide you on SIP basics, risk profile, and KYC steps. (Returns are not guaranteed.)"
-    )
-
-  # ADD: option 8 - Existing policy review & portfolio help
-  if opt == "8":
-    return (
-      "✅ *Existing Policy Review & Portfolio Help*\n\n"
-      "Share your existing policy numbers / fund names (or upload details via our dashboard).\n"
-      "We can help you understand premium due, maturity planning, and overall portfolio review."
-    )
-
-  # ADD: option 9 - Talk to human agent
-  if opt == "9":
-    return "Sure — connecting you to our human advisor now. Please wait, our team will reply shortly."
 
   if txt in {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening", "namaste"}:
     name = (customer_name or "").strip()
@@ -540,9 +497,15 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
     return (
       f"👋 {prefix}welcome to *Nath Investment*! I am *Shashinath Thakur*. How can I help you today?\n\n"
       "Please choose an option 👇\n\n"
-      "🟢 1️⃣ *About Nath Investments & our services*\n"
-      "🔵 2️⃣ *Know your policy details*\n"
-      "🟠 3️⃣ *Talk to our human agent*"
+      "1️⃣ *About Nath Investments & our services*\n"
+      "2️⃣ *Know your policy details*\n"
+      "3️⃣ *Premium due & reminders*\n"
+      "4️⃣ *Policy maturity & benefits*\n"
+      "5️⃣ *Claim process & documents*\n"
+      "6️⃣ *Health / Life / Car / Group Insurance guidance*\n"
+      "7️⃣ *Mutual Fund & SIP guidance*\n"
+      "8️⃣ *Existing policy review & portfolio help*\n"
+      "9️⃣ *Talk to our human agent*"
     )
   # If no key, skip auto-reply
   if not OPENAI_API_KEY:
@@ -1110,98 +1073,6 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
           try:
             if (msg.get("type") == "text") and (text_body or "").strip():
               user_clean = (text_body or "").strip()
-
-              # ADD: handle WhatsApp interactive replies (buttons / list)
-              if msg.get("type") == "interactive":
-                try:
-                  interactive = msg.get("interactive") or {}
-                  itype = interactive.get("type")
-                  sel_id = None
-                  sel_title = None
-                  if itype == "button_reply":
-                    br = interactive.get("button_reply") or {}
-                    sel_id = br.get("id")
-                    sel_title = br.get("title")
-                  elif itype == "list_reply":
-                    lr = interactive.get("list_reply") or {}
-                    sel_id = lr.get("id")
-                    sel_title = lr.get("title")
-
-                  chosen = (sel_id or sel_title or "").strip()
-                  if chosen:
-                    # Send welcome image on greeting choices as well (non-destructive)
-                    reply = openai_generate_reply(
-                      customer_phone=customer_phone,
-                      customer_name=customer_name,
-                      user_text=chosen,
-                      policy_number=policy_number,
-                      db=db,
-                    )
-                    if reply:
-                      _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
-                      send_whatsapp_text(customer_phone, reply)
-                      db.add(
-                        InboxMessage(
-                          conversation_id=conv.id,
-                          direction="OUT",
-                          body=reply,
-                          actor_user_id=None,
-                          created_at=now_utc(),
-                        )
-                      )
-                      conv.last_message_at = now_utc()
-                      conv.updated_at = now_utc()
-                      audit(
-                        db,
-                        channel="WHATSAPP",
-                        request_id=None,
-                        action="AUTO_REPLY",
-                        policy_number=policy_number,
-                        customer_phone=customer_phone,
-                        success=True,
-                        reason="INTERACTIVE",
-                      )
-                      db.commit()
-                    continue
-                except Exception:
-                  # fall back to existing handling
-                  pass
-
-              # ADD: fix human-handoff keyword detection (word-boundary regex)
-              try:
-                if re.search(r"\b(agent|human|representative|advisor|support|call me|callback|talk to|speak to)\b", user_clean, flags=re.I):
-                  conv.status = "PENDING"
-                  conv.updated_at = now_utc()
-                  conv.last_message_at = now_utc()
-                  handoff_msg = "Sure — I’m connecting you to a human advisor at Nath Investments. An agent will reply shortly."
-                  _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
-                  send_whatsapp_text(customer_phone, handoff_msg)
-                  db.add(
-                    InboxMessage(
-                      conversation_id=conv.id,
-                      direction="OUT",
-                      body=handoff_msg,
-                      actor_user_id=None,
-                      created_at=now_utc(),
-                    )
-                  )
-                  conv.last_message_at = now_utc()
-                  conv.updated_at = now_utc()
-                  audit(
-                    db,
-                    channel="WHATSAPP",
-                    request_id=None,
-                    action="HUMAN_HANDOFF",
-                    policy_number=policy_number,
-                    customer_phone=customer_phone,
-                    success=True,
-                    reason="KEYWORD",
-                  )
-                  db.commit()
-                  continue
-              except Exception:
-                pass
-
 
               # Human handoff: if user asks for an agent/human, mark conversation PENDING and notify
               if re.search(r"(agent|human|representative|advisor|support|call me|callback|talk to|speak to)", user_clean, flags=re.I):
