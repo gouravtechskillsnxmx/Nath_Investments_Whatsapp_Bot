@@ -166,17 +166,20 @@ def send_whatsapp_list_menu(
 
 
 def _main_menu_rows_v1() -> list[dict]:
-  """Row IDs are simple numbers so we can route 1-9 easily."""
+  # IMPORTANT: WhatsApp "list" rows have strict limits:
+  #  - title: <= 24 chars
+  #  - description: <= 72 chars
+  # If these limits are exceeded, Meta will reject the message.
   return [
-    {"id": "1", "title": "About Nath Investments & our services"},
-    {"id": "2", "title": "Know your policy details"},
-    {"id": "3", "title": "Premium due & reminders"},
-    {"id": "4", "title": "Policy maturity & benefits"},
-    {"id": "5", "title": "Claim process & documents"},
-    {"id": "6", "title": "Health / Life / Car / Group Insurance guidance"},
-    {"id": "7", "title": "Mutual Fund & SIP guidance"},
-    {"id": "8", "title": "Existing policy review & portfolio help"},
-    {"id": "9", "title": "Talk to our human agent"},
+    {"id": "1", "title": "About & Services", "description": "All services we offer + how we help you"},
+    {"id": "2", "title": "Policy details", "description": "Check premium due, status, maturity date & amount"},
+    {"id": "3", "title": "Premium reminders", "description": "Premium due dates, reminders & grace period guidance"},
+    {"id": "4", "title": "Maturity & benefits", "description": "Maturity amount, bonus info & payout options (general)"},
+    {"id": "5", "title": "Claims & documents", "description": "Claim steps + documents checklist (death/maturity/medical)"},
+    {"id": "6", "title": "Insurance guidance", "description": "Health/Life/Car/Group insurance guidance"},
+    {"id": "7", "title": "Mutual Fund / SIP", "description": "SIP, lumpsum, KYC basics & general guidance"},
+    {"id": "8", "title": "Policy/Portfolio review", "description": "Review existing policies & investments, optimize coverage"},
+    {"id": "9", "title": "Talk to human", "description": "Connect to Shashinath Thakur / team advisor"},
   ]
 
 
@@ -1081,6 +1084,16 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
 
           if msg.get("type") == "text":
             text_body = msg.get("text", {}).get("body", "")
+          elif msg.get("type") == "interactive":
+            # List menu / button replies arrive as "interactive"
+            inter = msg.get("interactive", {}) or {}
+            # Prefer the stable id so our menu routing works reliably (1-9)
+            if isinstance(inter.get("list_reply"), dict):
+              text_body = inter["list_reply"].get("id") or inter["list_reply"].get("title") or ""
+            elif isinstance(inter.get("button_reply"), dict):
+              text_body = inter["button_reply"].get("id") or inter["button_reply"].get("title") or ""
+            else:
+              text_body = "[interactive message received]"
           else:
             text_body = f"[{msg.get('type', 'unknown')} message received]"
 
