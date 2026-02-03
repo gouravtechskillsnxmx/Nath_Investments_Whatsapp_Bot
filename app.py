@@ -1196,6 +1196,72 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
 
           # Auto-reply (OpenAI) - keep everything else the same
           try:
+            # --- ADD: handle WhatsApp interactive list/button replies (type="interactive") ---
+            # Meta sends list selections as: msg["type"]="interactive" and msg["interactive"]["list_reply"]["id"]/["title"]
+            # We convert it to a synthetic text like "1".."9" so existing openai_generate_reply() routing works.
+            if msg.get("type") == "interactive":
+              try:
+                it = msg.get("interactive") or {}
+                chosen_id = None
+                chosen_title = None
+                if "list_reply" in it and it["list_reply"]:
+                  chosen_id = (it["list_reply"].get("id") or "").strip()
+                  chosen_title = (it["list_reply"].get("title") or "").strip()
+                elif "button_reply" in it and it["button_reply"]:
+                  chosen_id = (it["button_reply"].get("id") or "").strip()
+                  chosen_title = (it["button_reply"].get("title") or "").strip()
+
+                # If id is like "MENU_1", extract the number; else accept raw "1".."9"
+                selected_opt = None
+                if chosen_id:
+                  mnum = re.search(r"(\d+)", chosen_id)
+                  if mnum:
+                    selected_opt = mnum.group(1)
+                  elif chosen_id in {"1","2","3","4","5","6","7","8","9"}:
+                    selected_opt = chosen_id
+
+                # If user picked from list, reply with the relevant text for that option
+                if selected_opt:
+                  reply = openai_generate_reply(
+                    customer_phone=customer_phone,
+                    customer_name=customer_name,
+                    user_text=str(selected_opt),
+                    policy_number=policy_number,
+                    db=db,
+                  )
+                  if reply:
+                    # Optional: send welcome image when user first interacts
+                    _send_welcome_image_once(db, customer_phone=customer_phone, conv_id=conv.id)
+                    send_whatsapp_text(customer_phone, reply)
+                    db.add(
+                      InboxMessage(
+                        conversation_id=conv.id,
+                        direction="OUT",
+                        body=reply,
+                        actor_user_id=None,
+                        created_at=now_utc(),
+                      )
+                    )
+                    conv.last_message_at = now_utc()
+                    conv.updated_at = now_utc()
+                    audit(
+                      db,
+                      channel="WHATSAPP",
+                      request_id=None,
+                      action="AUTO_REPLY",
+                      policy_number=policy_number,
+                      customer_phone=customer_phone,
+                      success=True,
+                      reason="INTERACTIVE_MENU",
+                    )
+                    db.commit()
+
+                    # IMPORTANT: stop further handling for this msg to avoid double replies
+                    continue
+              except Exception:
+                # fallthrough: if anything fails, we let normal logic continue
+                pass
+
             if (msg.get("type") == "text") and (text_body or "").strip():
               user_clean = (text_body or "").strip()
 
