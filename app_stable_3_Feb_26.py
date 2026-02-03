@@ -312,7 +312,7 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
   # Deterministic menu routing for option selections (1/2/3)
   # Normalize common inputs like "1", "1.", "press 1", "option 1"
   opt = None
-  m_opt = re.search(r"\b([1-9])\b", txt)
+  m_opt = re.search(r"\b([123])\b", txt)
   if m_opt and txt in {m_opt.group(1), f"{m_opt.group(1)}.", f"press {m_opt.group(1)}", f"option {m_opt.group(1)}"}:
     opt = m_opt.group(1)
   # Also accept single-character inputs with whitespace
@@ -480,16 +480,8 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
 
   if opt == "3":
 
-    # Premium due & reminders
-    return (
-      "🔔 *Premium Due & Reminders*\n\n"
-      "I can help you with:\n"
-      "• Next premium due date\n"
-      "• Premium reminders\n"
-      "• Avoid policy lapse\n\n"
-      "Please share your policy number to continue."
-    )
-
+    # Human handoff phrase; existing handoff logic in webhook can also detect keywords.
+    return "Sure — connecting you to a human advisor now. Please wait, our team will reply shortly."
 
   if txt in {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening", "namaste"}:
     name = (customer_name or "").strip()
@@ -497,15 +489,9 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
     return (
       f"👋 {prefix}welcome to *Nath Investment*! I am *Shashinath Thakur*. How can I help you today?\n\n"
       "Please choose an option 👇\n\n"
-      "1️⃣ *About Nath Investments & our services*\n"
-      "2️⃣ *Know your policy details*\n"
-      "3️⃣ *Premium due & reminders*\n"
-      "4️⃣ *Policy maturity & benefits*\n"
-      "5️⃣ *Claim process & documents*\n"
-      "6️⃣ *Health / Life / Car / Group Insurance guidance*\n"
-      "7️⃣ *Mutual Fund & SIP guidance*\n"
-      "8️⃣ *Existing policy review & portfolio help*\n"
-      "9️⃣ *Talk to our human agent*"
+      "🟢 1️⃣ *About Nath Investments & our services*\n"
+      "🔵 2️⃣ *Know your policy details*\n"
+      "🟠 3️⃣ *Talk to our human agent*"
     )
   # If no key, skip auto-reply
   if not OPENAI_API_KEY:
