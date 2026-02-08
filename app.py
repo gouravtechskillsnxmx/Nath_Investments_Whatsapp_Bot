@@ -3581,3 +3581,40 @@ def home():
 </body></html>
     """
   )
+
+
+
+# ============================================================
+# ADD-ONLY: Numeric menu (1–10) + MENU keyword + analytics
+# ============================================================
+
+MENU_TEXT = (
+    "Please choose an option 👇\n\n"
+    "1️⃣ About Nath Investments & our services\n"
+    "2️⃣ Know your policy details\n"
+    "3️⃣ Premium due & reminders\n"
+    "4️⃣ Policy maturity & benefits\n"
+    "5️⃣ Claim process & required documents\n"
+    "6️⃣ Health / Life / Car / Group Insurance guidance\n"
+    "7️⃣ Mutual Fund & SIP guidance\n"
+    "8️⃣ Existing policy review & portfolio help\n"
+    "9️⃣ Investment & tax planning guidance\n"
+    "🔟 Talk to our human agent\n\n"
+    "✍️ Reply with option number (1–10)\n"
+    "_Type MENU anytime to see these options again_"
+)
+
+MENU_ANALYTICS = globals().get("MENU_ANALYTICS", {
+    "1": 0, "2": 0, "3": 0, "4": 0, "5": 0,
+    "6": 0, "7": 0, "8": 0, "9": 0, "10": 0
+})
+
+def track_menu_option(opt: str):
+    try:
+        MENU_ANALYTICS[opt] = MENU_ANALYTICS.get(opt, 0) + 1
+    except Exception:
+        pass
+
+# ============================================================
+# END ADD-ONLY BLOCK
+# ============================================================
