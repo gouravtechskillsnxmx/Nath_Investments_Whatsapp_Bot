@@ -3398,3 +3398,110 @@ def home():
     </body></html>
     """
   )
+
+
+
+# ============================================================
+# ADD-ONLY: Menu auto-replies (1–9), Option 10 call, Analytics
+# ============================================================
+
+MENU_ANALYTICS = globals().get("MENU_ANALYTICS", {
+    "1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0, "10": 0
+})
+
+def _track_menu(opt: str):
+    try:
+        MENU_ANALYTICS[opt] = MENU_ANALYTICS.get(opt, 0) + 1
+    except Exception:
+        pass
+
+def menu_auto_reply_addonly(opt: str, prefix: str = ""):
+    _track_menu(opt)
+
+    if opt == "1":
+        return (
+            f"{prefix}🟢 About Nath Investments & Our Services\n\n"
+            "Insurance & Investment consultancy with 25+ years of experience."
+        )
+
+    if opt == "2":
+        return (
+            f"{prefix}📄 Policy Details\n\n"
+            "Please share your policy number (6–20 digits)."
+        )
+
+    if opt == "3":
+        return (
+            f"{prefix}⏰ Premium Due & Reminders\n\n"
+            "Avoid policy lapse with timely premium reminders."
+        )
+
+    if opt == "4":
+        return (
+            f"{prefix}📅 Policy Maturity & Benefits\n\n"
+            "Know maturity date, benefits & bonuses."
+        )
+
+    if opt == "5":
+        return (
+            f"{prefix}🧾 Claim Process & Documents\n\n"
+            "Guidance for maturity, death & health claims."
+        )
+
+    if opt == "6":
+        return (
+            f"{prefix}🛡️ Insurance Guidance\n\n"
+            "Life, Health, Car & Group Insurance guidance."
+        )
+
+    if opt == "7":
+        return (
+            f"{prefix}📈 Mutual Funds & SIP\n\n"
+            "SIP, Lumpsum & portfolio review."
+        )
+
+    if opt == "8":
+        return (
+            f"{prefix}🔍 Existing Policy Review\n\n"
+            "Professional review of your policies."
+        )
+
+    if opt == "9":
+        return (
+            f"{prefix}💬 Chat with Human Advisor\n\n"
+            "Advisor will reply shortly on WhatsApp."
+        )
+
+    if opt == "10":
+        return (
+            f"{prefix}📞 Calling Human Advisor\n\n"
+            "Connecting your call now."
+        )
+
+    return None
+
+def trigger_exotel_call_addonly(customer_number: str):
+    import os, requests
+    from_number = os.getenv("EXOTEL_FROM_NUMBER")
+    to_number = os.getenv("EXOTEL_TO_NUMBER")
+    api = os.getenv("EXOTEL_CALL_API")
+    sid = os.getenv("EXOTEL_SID")
+    token = os.getenv("EXOTEL_TOKEN")
+
+    if not (from_number and to_number and api and sid and token):
+        return False
+
+    try:
+        requests.post(
+            api,
+            auth=(sid, token),
+            data={"From": from_number, "To": to_number, "CallerId": from_number},
+            timeout=10
+        )
+        return True
+    except Exception:
+        return False
+
+# ============================================================
+# END ADD-ONLY BLOCK
+# ============================================================
