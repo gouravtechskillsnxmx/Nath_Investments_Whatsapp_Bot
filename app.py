@@ -68,6 +68,36 @@ WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v17.0")
 WHATSAPP_WELCOME_IMAGE_PATH = os.getenv("WHATSAPP_WELCOME_IMAGE_PATH", "nathinvestment.jpeg")
 WHATSAPP_WELCOME_IMAGE_CAPTION = os.getenv("WHATSAPP_WELCOME_IMAGE_CAPTION", "")
 
+
+# =========================================================
+# MENU (Numeric 1-10) + Re-show keyword
+# =========================================================
+MENU_TRIGGER_KEYWORDS = {"menu", "type menu", "options", "help", "start"}
+MENU_TEXT = (
+  "Please choose an option 👇\n\n"
+  "1️⃣ About Nath Investments & our services\n"
+  "2️⃣ Know your policy details\n"
+  "3️⃣ Premium due & reminders\n"
+  "4️⃣ Policy maturity & benefits\n"
+  "5️⃣ Claim process & documents\n"
+  "6️⃣ Health / Life / Car / Group Insurance guidance\n"
+  "7️⃣ Mutual Fund & SIP guidance\n"
+  "8️⃣ Existing policy review & portfolio help\n"
+  "9️⃣ Stock market / investment guidance (general)\n"
+  "🔟 Call our human agent"
+)
+
+# =========================================================
+# EXOTEL (optional) - for option 10 "Call human agent"
+# =========================================================
+EXOTEL_SID = os.getenv("EXOTEL_SID", "")
+EXOTEL_API_KEY = os.getenv("EXOTEL_API_KEY", "")
+EXOTEL_API_TOKEN = os.getenv("EXOTEL_API_TOKEN", "")
+EXOTEL_FROM = os.getenv("EXOTEL_FROM", "")  # your Exotel virtual number (e.g., 080xxxxxxx)
+EXOTEL_TO = os.getenv("EXOTEL_TO", "")      # agent/office number to ring (10-digit mobile or landline)
+EXOTEL_CALLER_ID = os.getenv("EXOTEL_CALLER_ID", "")  # optional, defaults to EXOTEL_FROM
+EXOTEL_EXOML_URL = os.getenv("EXOTEL_EXOML_URL", "")  # optional ExoML URL if you use it
+
 # OpenAI (optional auto-replies)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -121,6 +151,8 @@ def send_whatsapp_text(to_number: str, body: str) -> dict:
 
 
 def send_whatsapp_list_menu(
+                # ALSO send visible numbered options (so user can type 1-10)
+                send_whatsapp_text(customer_phone, MENU_TEXT)
   to_number: str,
   *,
   header_text: str,
@@ -245,6 +277,32 @@ def send_whatsapp_image(to_number: str, *, image_path: str, caption: str | None 
   if r.status_code >= 400:
     raise RuntimeError(f"WhatsApp image send failed: {r.status_code} {r.text}")
   return r.json()
+
+
+
+def exotel_make_call(*, customer_phone_e164: str) -> dict:
+  """Best-effort: place an outbound call via Exotel. Returns dict with status."""
+  try:
+    if not (EXOTEL_SID and EXOTEL_API_KEY and EXOTEL_API_TOKEN and EXOTEL_FROM and EXOTEL_TO):
+      return {"ok": False, "reason": "EXOTEL_NOT_CONFIGURED"}
+    url = f"https://api.exotel.com/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
+    auth = (EXOTEL_API_KEY, EXOTEL_API_TOKEN)
+    payload = {
+      "From": EXOTEL_FROM,
+      "To": EXOTEL_TO,
+      "CallerId": EXOTEL_CALLER_ID or EXOTEL_FROM,
+    }
+    # If you have an ExoML app flow, provide it (otherwise Exotel may use default)
+    if EXOTEL_EXOML_URL:
+      payload["Url"] = EXOTEL_EXOML_URL
+    # Include customer phone as custom field (useful in Exotel logs)
+    payload["CustomField"] = (customer_phone_e164 or "")[:60]
+    r = requests.post(url, auth=auth, data=payload, timeout=20)
+    if r.status_code >= 400:
+      return {"ok": False, "reason": f"{r.status_code} {r.text[:200]}"}
+    return {"ok": True, "raw": r.text[:500]}
+  except Exception as e:
+    return {"ok": False, "reason": str(e)[:200]}
 
 
 def _welcome_image_already_sent(db: Session, *, customer_phone: str) -> bool:
@@ -388,6 +446,13 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
   # ADD: accept menu options 4-9 as well
   if txt in {"4","5","6","7","8","9"}:
     opt = txt
+
+# Record menu analytics (counts in /admin/analytics/menu)
+try:
+  audit(db, customer_phone, action="MENU_CLICK", reason=f"OPT:{opt}", success=True)
+except Exception:
+  pass
+
 
   if opt == "1":
     name = (customer_name or "").strip()
@@ -637,7 +702,28 @@ def openai_generate_reply(*, customer_phone: str, customer_name: str | None, use
       "We can help you understand premium due, maturity planning, and overall portfolio review."
     )
 
-  # ADD: option 9 - Talk to human agent
+  
+
+# ADD: option 9 - Stock market / investment guidance (general)
+if opt == "9":
+  return (
+    "📈 *Stock Market / Investment Guidance (General)*\n\n"
+    "I can help you with:\n"
+    "• Basics of equity investing & risk profiling\n"
+    "• SIP vs Lump-sum decisions (goal-based)\n"
+    "• Asset allocation (Equity/Debt/Gold)\n"
+    "• Long-term wealth planning\n\n"
+    "⚠️ Note: This is general guidance (not a guaranteed return).\n"
+    "Reply with: *Age + Monthly savings + Goal + Time horizon* and I’ll suggest a plan."
+  )
+
+# ADD: option 10 - Call human agent (Exotel optional)
+if opt == "10":
+  result = exotel_make_call(customer_phone_e164=customer_phone)
+  if result.get("ok"):
+    return "📞 *Call request received!* Our agent will call you shortly. If you prefer WhatsApp chat, type *menu* anytime."
+  return "📞 *Call request received!* Our agent will contact you soon. (Call automation not configured yet.)\n\nType *menu* to see options again."
+# ADD: option 9 - Talk to human agent
   if opt == "9":
     return "Sure — connecting you to our human advisor now. Please wait, our team will reply shortly."
 
@@ -1305,6 +1391,16 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
             if (msg.get("type") == "text") and (text_body or "").strip():
               user_clean = (text_body or "").strip()
 
+# Re-show menu on demand
+if user_clean.lower() in MENU_TRIGGER_KEYWORDS:
+  try:
+    send_whatsapp_list_menu(customer_phone)
+    send_whatsapp_text(customer_phone, MENU_TEXT)
+  except Exception as e:
+    logger.exception("Failed to send menu again: %s", e)
+  return {"ok": True}
+
+
               # ADD: If user greets (hi/hello/etc), send an Interactive List Menu (1-9) + image (if configured)
               try:
                 if _is_greeting_text(user_clean):
@@ -1318,6 +1414,8 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                   menu_header = "Nath Investment"
                   menu_body = "Please choose an option 👇"
                   send_whatsapp_list_menu(
+                # ALSO send visible numbered options (so user can type 1-10)
+                send_whatsapp_text(customer_phone, MENU_TEXT)
                     customer_phone,
                     header_text=menu_header,
                     body_text=menu_body,
@@ -2422,6 +2520,38 @@ def admin_contacts_report(db: Session = Depends(get_db)):
 # Dashboard (single-file HTML + CSS + JS)
 # =========================================================
 
+
+
+
+# =========================================================
+# Analytics: which menu option is clicked most
+# =========================================================
+@app.get("/admin/analytics/menu")
+def admin_menu_analytics(limit: int = 30, db: Session = Depends(get_db)):
+  """Returns counts for MENU_CLICK (OPT:1..10) aggregated."""
+  limit = min(max(int(limit), 1), 200)
+  rows = db.execute(
+    select(AuditLog.reason, AuditLog.created_at)
+    .where(AuditLog.action == "MENU_CLICK", AuditLog.success == True) # noqa: E712
+    .order_by(desc(AuditLog.created_at))
+    .limit(5000)
+  ).all()
+
+  counts = {}
+  last = {}
+  for reason, created_at in rows:
+    r = (reason or "")
+    m = re.search(r"OPT:(\d+)", r)
+    if not m:
+      continue
+    opt = m.group(1)
+    counts[opt] = counts.get(opt, 0) + 1
+    if opt not in last:
+      last[opt] = created_at.isoformat() if created_at else None
+
+  items = [{"option": int(k), "count": v, "last_clicked_at": last.get(k)} for k, v in counts.items()]
+  items.sort(key=lambda x: (-x["count"], x["option"]))
+  return {"items": items[:limit]}
 DASHBOARD_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -3395,113 +3525,59 @@ def home():
       <li><code>POST /policy/lookup</code></li>
       <li><code>POST /admin/inbox/conversations/&lt;id&gt;/send</code> (delivers if OUT)</li>
      </ul>
-    </body></html>
+    
+
+<!-- ======================= -->
+<!-- Menu Analytics (NEW) -->
+<!-- ======================= -->
+<div class="card" style="margin-top:16px;border:1px solid rgba(0,0,0,.15);border-radius:14px;overflow:hidden;">
+  <div class="card-header" style="padding:12px 14px;background:linear-gradient(90deg,#0ea5e9,#22c55e);color:#fff;">
+    <div style="font-weight:700;">Menu Analytics</div>
+    <div style="opacity:.95;font-size:13px;">Which option is clicked most (1–10)</div>
+  </div>
+  <div class="card-body" style="padding:14px;">
+    <button id="btnMenuAnalytics" class="btn" type="button">Refresh Menu Analytics</button>
+    <div id="menuAnalyticsStatus" style="margin-top:10px;color:#444;font-size:13px;"></div>
+    <div id="menuAnalyticsList" style="margin-top:10px;"></div>
+  </div>
+</div>
+
+<script>
+  async function loadMenuAnalytics(){
+    const statusEl = document.getElementById('menuAnalyticsStatus');
+    const listEl = document.getElementById('menuAnalyticsList');
+    statusEl.textContent = 'Loading...';
+    listEl.innerHTML = '';
+    try{
+      const res = await fetch('/admin/analytics/menu?limit=20');
+      const data = await res.json();
+      const items = (data && data.items) ? data.items : [];
+      if(!items.length){
+        statusEl.textContent = 'No clicks captured yet.';
+        return;
+      }
+      statusEl.textContent = 'Updated.';
+      const rows = items.map(it => {
+        const opt = it.option;
+        const cnt = it.count;
+        const last = it.last_clicked_at ? it.last_clicked_at : '';
+        return `<div style="display:flex;gap:10px;align-items:center;border:1px solid rgba(0,0,0,.08);border-radius:12px;padding:10px 12px;margin-bottom:8px;">
+            <div style="width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:#111;color:#fff;font-weight:800;">${opt}</div>
+            <div style="flex:1;">
+              <div style="font-weight:700;">Option ${opt}</div>
+              <div style="font-size:13px;color:#555;">Clicks: <b>${cnt}</b> ${last ? `• Last: ${last}` : ''}</div>
+            </div>
+          </div>`;
+      }).join('');
+      listEl.innerHTML = rows;
+    }catch(e){
+      statusEl.textContent = 'Failed to load analytics.';
+    }
+  }
+  const btn = document.getElementById('btnMenuAnalytics');
+  if(btn){ btn.addEventListener('click', loadMenuAnalytics); }
+</script>
+
+</body></html>
     """
   )
-
-
-
-# ============================================================
-# ADD-ONLY: Menu auto-replies (1–9), Option 10 call, Analytics
-# ============================================================
-
-MENU_ANALYTICS = globals().get("MENU_ANALYTICS", {
-    "1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0, "10": 0
-})
-
-def _track_menu(opt: str):
-    try:
-        MENU_ANALYTICS[opt] = MENU_ANALYTICS.get(opt, 0) + 1
-    except Exception:
-        pass
-
-def menu_auto_reply_addonly(opt: str, prefix: str = ""):
-    _track_menu(opt)
-
-    if opt == "1":
-        return (
-            f"{prefix}🟢 About Nath Investments & Our Services\n\n"
-            "Insurance & Investment consultancy with 25+ years of experience."
-        )
-
-    if opt == "2":
-        return (
-            f"{prefix}📄 Policy Details\n\n"
-            "Please share your policy number (6–20 digits)."
-        )
-
-    if opt == "3":
-        return (
-            f"{prefix}⏰ Premium Due & Reminders\n\n"
-            "Avoid policy lapse with timely premium reminders."
-        )
-
-    if opt == "4":
-        return (
-            f"{prefix}📅 Policy Maturity & Benefits\n\n"
-            "Know maturity date, benefits & bonuses."
-        )
-
-    if opt == "5":
-        return (
-            f"{prefix}🧾 Claim Process & Documents\n\n"
-            "Guidance for maturity, death & health claims."
-        )
-
-    if opt == "6":
-        return (
-            f"{prefix}🛡️ Insurance Guidance\n\n"
-            "Life, Health, Car & Group Insurance guidance."
-        )
-
-    if opt == "7":
-        return (
-            f"{prefix}📈 Mutual Funds & SIP\n\n"
-            "SIP, Lumpsum & portfolio review."
-        )
-
-    if opt == "8":
-        return (
-            f"{prefix}🔍 Existing Policy Review\n\n"
-            "Professional review of your policies."
-        )
-
-    if opt == "9":
-        return (
-            f"{prefix}💬 Chat with Human Advisor\n\n"
-            "Advisor will reply shortly on WhatsApp."
-        )
-
-    if opt == "10":
-        return (
-            f"{prefix}📞 Calling Human Advisor\n\n"
-            "Connecting your call now."
-        )
-
-    return None
-
-def trigger_exotel_call_addonly(customer_number: str):
-    import os, requests
-    from_number = os.getenv("EXOTEL_FROM_NUMBER")
-    to_number = os.getenv("EXOTEL_TO_NUMBER")
-    api = os.getenv("EXOTEL_CALL_API")
-    sid = os.getenv("EXOTEL_SID")
-    token = os.getenv("EXOTEL_TOKEN")
-
-    if not (from_number and to_number and api and sid and token):
-        return False
-
-    try:
-        requests.post(
-            api,
-            auth=(sid, token),
-            data={"From": from_number, "To": to_number, "CallerId": from_number},
-            timeout=10
-        )
-        return True
-    except Exception:
-        return False
-
-# ============================================================
-# END ADD-ONLY BLOCK
-# ============================================================
