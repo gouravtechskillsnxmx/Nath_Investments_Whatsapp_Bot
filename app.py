@@ -3413,21 +3413,21 @@ def home():
 # ADD-ONLY: MENU_TEXT + MENU_ANALYTICS + Option10 Exotel Call
 # ============================================================
 
-MENU_TEXT = (
-  "Please choose an option 👇\n\n"
-  "1️⃣ About Nath Investments & our services\n"
-  "2️⃣ Know your policy details\n"
-  "3️⃣ Premium due & reminders\n"
-  "4️⃣ Policy maturity & benefits\n"
-  "5️⃣ Claim process & required documents\n"
-  "6️⃣ Health / Life / Car / Group Insurance guidance\n"
-  "7️⃣ Mutual Fund & SIP guidance\n"
-  "8️⃣ Existing policy review & portfolio help\n"
-  "9️⃣ Investment & tax planning guidance\n"
-  "🔟 Call / talk to our human agent\n\n"
-  "✍️ Reply with option number (1–10)\n"
-  "_Type *MENU* anytime to see these options again_"
-)
+MENU_TEXT = """Please choose an option 👇
+
+🟢 1️⃣ About Nath Investments & our services
+🔵 2️⃣ Know your policy details
+🟠 3️⃣ Premium due & reminders
+🟣 4️⃣ Policy maturity & benefits
+🟡 5️⃣ Claim process & required documents
+🟤 6️⃣ Health / Life / Car / Group Insurance guidance
+🟩 7️⃣ Mutual Fund & SIP guidance
+🟦 8️⃣ Existing policy review & portfolio help
+🟥 9️⃣ Investment & tax planning guidance
+⬛ 🔟 Call / talk to our human agent
+
+✍️ Reply with option number (1-10). Type *MENU* anytime to see options again.
+"""
 
 MENU_ANALYTICS = globals().get(
   "MENU_ANALYTICS",
