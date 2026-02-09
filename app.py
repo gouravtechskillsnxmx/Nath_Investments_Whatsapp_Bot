@@ -68,6 +68,10 @@ WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v17.0")
 WHATSAPP_WELCOME_IMAGE_PATH = os.getenv("WHATSAPP_WELCOME_IMAGE_PATH", "nathinvestment.jpeg")
 WHATSAPP_WELCOME_IMAGE_CAPTION = os.getenv("WHATSAPP_WELCOME_IMAGE_CAPTION", "")
 
+# Menu mode: numeric-only menu (user replies with 1-10) vs WhatsApp interactive list menu.
+# Default: numeric-only to match your requirement.
+NUMERIC_MENU_ONLY = os.getenv("NUMERIC_MENU_ONLY", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
 # OpenAI (optional auto-replies)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -1246,28 +1250,44 @@ async def whatsapp_incoming(request: Request, db: Session = Depends(get_db)):
                   except Exception:
                     pass
 
-                  # Send list menu
-                  menu_header = "Nath Investment"
-                  menu_body = "Please choose an option 👇"
-                  send_whatsapp_list_menu(
-                    customer_phone,
-                    header_text=menu_header,
-                    body_text=menu_body,
-                    button_text="View Options",
-                    section_title="Main Menu",
-                    rows=_main_menu_rows_v1(),
-                  )
+                  # Send menu (numeric-only vs list menu)
+                  if NUMERIC_MENU_ONLY:
+                    # Numeric menu: user replies with 1-10
+                    send_whatsapp_text(customer_phone, MENU_TEXT)
 
-                  # Store OUT markers in conversation thread (history)
-                  db.add(
-                    InboxMessage(
-                      conversation_id=conv.id,
-                      direction="OUT",
-                      body="[LIST_MENU_SENT]",
-                      actor_user_id=None,
-                      created_at=now_utc(),
+                    # Store OUT message in conversation thread (history)
+                    db.add(
+                      InboxMessage(
+                        conversation_id=conv.id,
+                        direction="OUT",
+                        body=MENU_TEXT,
+                        actor_user_id=None,
+                        created_at=now_utc(),
+                      )
                     )
-                  )
+                  else:
+                    # Send list menu
+                    menu_header = "Nath Investment"
+                    menu_body = "Please choose an option 👇"
+                    send_whatsapp_list_menu(
+                      customer_phone,
+                      header_text=menu_header,
+                      body_text=menu_body,
+                      button_text="View Options",
+                      section_title="Main Menu",
+                      rows=_main_menu_rows_v1(),
+                    )
+
+                    # Store OUT markers in conversation thread (history)
+                    db.add(
+                      InboxMessage(
+                        conversation_id=conv.id,
+                        direction="OUT",
+                        body="[LIST_MENU_SENT]",
+                        actor_user_id=None,
+                        created_at=now_utc(),
+                      )
+                    )
                   conv.last_message_at = now_utc()
                   conv.updated_at = now_utc()
                   db.commit()
