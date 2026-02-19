@@ -3413,17 +3413,21 @@ def home():
 # ADD-ONLY: MENU_TEXT + MENU_ANALYTICS + Option10 Exotel Call
 # ============================================================
 
-MENU_TEXT = """Please choose an option 👇 
+MENU_TEXT = """Please choose an option 👇
 
-🟢 1️⃣ Call +91 79 7703 8184 for Mutual Funds
-🔵 2️⃣ Call +91 91371 16996 for LIC
-🟠 3️⃣ Call +91 99877 23941 for Star Health
-🟣 4️⃣ Call 9821265766 for Anything Else
+🟢 1️⃣ About Nath Investments & our services
+🔵 2️⃣ Know your policy details
+🟠 3️⃣ Premium due & reminders
+🟣 4️⃣ Policy maturity & benefits
+🟡 5️⃣ Claim process & required documents
+🟤 6️⃣ Health / Life / Car / Group Insurance guidance
+🟩 7️⃣ Mutual Fund & SIP guidance
+🟦 8️⃣ Existing policy review & portfolio help
+🟥 9️⃣ Investment & tax planning guidance
+⬛ 🔟 Call / talk to our human agent
 
-📞 Click the number above to call directly.
-Type *MENU* anytime to see options again.
+✍️ Reply with option number (1-10). Type *MENU* anytime to see options again.
 """
-
 
 MENU_ANALYTICS = globals().get(
   "MENU_ANALYTICS",
