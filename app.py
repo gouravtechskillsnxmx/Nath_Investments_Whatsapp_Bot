@@ -3415,10 +3415,10 @@ def home():
 
 MENU_TEXT = """Please choose an option 👇 
 
-🟢 1️⃣ Call +91 79 7703 8184 for Mutual Funds
-🔵 2️⃣ Call +91 91371 16996 for LIC
-🟠 3️⃣ Call +91 99877 23941 for Star Health
-🟣 4️⃣ Call 9821265766 for Anything Else
+🟢 1️⃣ Call +917977038184 for Mutual Funds
+🔵 2️⃣ Call +919137116996 for LIC
+🟠 3️⃣ Call +919987723941 for Star Health
+🟣 4️⃣ Call +919821265766 for Anything Else
 
 📞 Click the number above to call directly.
 Type *MENU* anytime to see options again.
